@@ -1,0 +1,42 @@
+-- workbench autotool
+-- author: oiltanker
+
+--[[
+    Automaic worbench tool script configurator.
+    Usage: using DLTX add 'mod_autoinject_<mod_string>.ltx' file and change
+        value of 'tool' in section 'workbench_autotool', you can generate example file
+        by launching game and it will be generated as 'gamedata\configs\autoinject.ltx'.
+]]
+
+workbench_section_name = 'workbench_autotool'
+workbench_tools_key = 'tools'
+workbench_cfg_file = 'autoinject.ltx'
+
+local function init_ini_file()
+    local default_table = {
+        'itm_basickit',
+        'itm_advancedkit',
+        'itm_expertkit',
+        'itm_drugkit',
+        'itm_ammokit',
+    }
+
+    local ini = ini_file_ex(workbench_cfg_file, true)
+    ini:w_value(workbench_section_name, workbench_tools_key, table.concat(default_table, ','))
+    ini:save()
+end
+
+function get_workbench_toolkits()
+    local ini = ini_file_ex(workbench_cfg_file, false)
+    if ini then
+        if ini:section_exist('workbench_autotool') then
+            local tools = ini:r_string_ex(workbench_section_name,workbench_tools_key)
+            return str_explode(tools,',')
+        else
+            init_ini_file()
+            return get_workbench_toolkits() -- because of DLTX
+        end
+    else
+        error('Could not open \'' .. workbench_cfg_file .. '\' file.')
+    end
+end

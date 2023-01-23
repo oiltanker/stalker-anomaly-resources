@@ -1,0 +1,56 @@
+-- item generator autoinject
+-- author: oiltanker
+
+item_parts.create_disassemble_list = function(t)
+	local str = ''
+	for i=1,#t do
+        if string.find(t[i], '_gen_itm_') == 1 and ini_sys:section_exist(t[i]) then
+            for k,v in pairs(utils_data.collect_section(ini_sys,t[i],true)) do
+                str = str .. "\\n- " .. ui_item.get_sec_name(k)
+                local value = tonumber(v)
+                if value and (not utils_item.is_degradable(nil, k) or IsItem("ammo", k) or IsItem("multiuse", k)) then
+                    str = str .. ' x' .. tostring(value)
+                end
+            end
+        else
+            str = str .. "\\n- " .. ui_item.get_sec_name(t[i])
+        end
+	end
+	return str
+end
+
+itms_manager.create_item = function(section, owner, t)
+    local instance = itms_manager.get_item_processor()
+
+    if string.find(section, '_gen_itm_') == 1 and ini_sys:section_exist(section) then
+        local se_tbl = {}
+        for k,v in pairs(utils_data.collect_section(ini_sys,section,true)) do
+            local ammo_or_multi = false
+            local params = {}
+
+            local value = tonumber(v)
+            if value then
+                if IsItem("ammo", k) then
+                    ammo_or_multi = true
+                    params.ammo = value
+                elseif IsItem("multiuse", k) then
+                    ammo_or_multi = true
+                    params.uses = value
+                elseif utils_item.is_degradable(nil, section) then
+                    params.cond = value
+                end
+            end
+
+            if ammo_or_multi then
+                table.insert(se_tbl, instance:Create_Item(k, owner, params))
+            elseif value then
+                for _=1,value do table.insert(se_tbl, instance:Create_Item(k, owner, params)) end
+            else
+                table.insert(se_tbl, instance:Create_Item(k, owner, params))
+            end
+        end
+        return se_tbl
+    else
+        return instance:Create_Item(section, owner, t)
+    end
+end

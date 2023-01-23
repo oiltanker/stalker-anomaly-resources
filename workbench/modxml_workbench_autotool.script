@@ -1,0 +1,73 @@
+-- workbench autotool
+-- author: oiltanker
+
+--[[
+    Allows to simply insert the tool into tool list and it will insert needed xml entries.
+    NOTE: tool textures need to be 1x2, everything else is not supported.
+    Usage: see in 'workbench_autotool.script'
+]]
+
+local ui_file = [[ui\ui_workshop.xml]]
+local ui_file_16 = [[ui\ui_workshop_16.xml]]
+
+local ui_fieldcooker_workshop = [[
+    <pic_toolkit_@_b x="436" y="327" width="164" height="173" stretch="1">
+        <texture>ui_inGame2_workshop_toolkit</texture>
+    </pic_toolkit_@_b>
+    <pic_toolkit_@ x="444" y="335" width="148" height="157" stretch="1"/>
+    <txt_toolkit_@ x="436" y="500" width="164" height="35">
+        <text complex_mode="1" r="200" g="200" b="200" align="c" vert_align="c" font="letterica18"/>
+    </txt_toolkit_@>
+]]
+
+
+local ui_item = [[ui\textures_descr\ui_item.xml]]
+local ui_fieldcooker_item = [[
+    <texture id="ui_inGame2_btn_workshop_toolkit_@_d" x="186" y="628" width="186" height="157" /> <!-- disabled -->
+    <texture id="ui_inGame2_btn_workshop_toolkit_@_e" x="186" y="628" width="186" height="157" /> <!-- normal -->
+    <texture id="ui_inGame2_btn_workshop_toolkit_@_h" x="0" y="628" width="186" height="157" /> <!-- hover -->
+    <texture id="ui_inGame2_btn_workshop_toolkit_@_t" x="0" y="628" width="186" height="157" /> <!-- toggle -->
+]]
+
+
+function get_ui_workshop_insert(idx)
+    return string.gsub(ui_fieldcooker_workshop, '@', tostring(idx))
+end
+
+function get_ui_item_insert(idx)
+    return string.gsub(ui_fieldcooker_item, '@', tostring(idx))
+end
+
+function on_xml_read()
+    RegisterScriptCallback('on_xml_read', function(xml_file_name, xml_obj)
+        -- ui_workshop
+        if xml_file_name == ui_file or xml_file_name == ui_file_16 then
+            local toolkit_count = #workbench_autotool.get_workbench_toolkits()
+
+            local res = xml_obj:query('workshop>state')
+            if is_not_empty(res) and res[1] then
+                local el = res[1]
+                for i=6,toolkit_count do
+                    if is_empty(xml_obj:query('workshop>state>pic_toolkit_' .. i)) then
+                        xml_obj:insertFromXMLString(get_ui_workshop_insert(i), el, #el.kids)
+                    end
+                end
+            end
+        end
+
+        -- ui_item
+        if xml_file_name == ui_item then
+            local toolkit_count = #workbench_autotool.get_workbench_toolkits()
+
+            local res = xml_obj:query('file[name=ui\\items\\ui_toolkits_big]')
+            if is_not_empty(res) and res[1] then
+                local el = res[1]
+                for i=6,toolkit_count do
+                    if is_empty(xml_obj:query('file[name=ui\\items\\ui_toolkits_big]>texture[id=ui_inGame2_btn_workshop_toolkit_' .. i .. '_h]')) then
+                        xml_obj:insertFromXMLString(get_ui_item_insert(i), el, #el.kids)
+                    end
+                end
+            end
+        end
+    end)
+end

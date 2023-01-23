@@ -1,0 +1,210 @@
+-- workbench fix
+-- author: oiltanker
+
+--[[
+    Changes:
+     - fixed multiuse items
+     - partial ammo use when crafting, alows fractions to specify partial box amount
+     - recipes now can have 1 ingredient
+     - support for 'keep crafting window open' addon
+]]
+
+ui_workshop.workshop_toolkits = workbench_autotool.get_workbench_toolkits()
+
+function ui_workshop.UIWorkshopCraft:LoadRecipes()
+    -- Less parts on achievement
+    local ach = 0
+    if (game_achievements.has_achievement("artificer_eagerness")) then
+        ach = 1
+    end
+
+    local ind = 1
+    local ini = itms_manager.ini_craft
+    while ini:section_exist(tostring(ind)) do
+        local ind_str = tostring(ind)
+        local n = ini:line_count(ind_str) or 0
+        self.recipes[ind] = {}
+        for i=0, n-1 do
+            local result, id, value = ini:r_line(ind_str , i , "", "")
+            if (id == "title") then
+                self.recipes_type[ind] = value
+            end
+            id = string.gsub(id, '^x%d*_', '')
+            if ini_sys:section_exist(id) then
+                local t = str_explode(value,",")
+                if (#t == 4) or (#t == 6) or (#t == 8) or (#t == 10) then
+                    local x = #self.recipes[ind] + 1
+                    self.recipes[ind][x] = {}
+                    self.recipes[ind][x].sec = id
+                    self.recipes[ind][x].tool = tonumber(t[1]) or 1
+                    self.recipes[ind][x].rsp = t[2]
+                    if t[3] and t[4] then -- support item 1
+                        if ini_sys:section_exist(tostring(t[3])) then
+                            local amt = tonumber(t[4])
+                            self.recipes[ind][x][1] = {tostring(t[3]), (amt > 4) and (amt - ach) or amt}
+                        else
+                            printe("! Workshop UI craft | componenet section [%s] not found for [%s] recipe!", tostring(t[3]), id)
+                        end
+                    end
+                    if t[5] and t[6] then -- support item 2
+                        if ini_sys:section_exist(tostring(t[5])) then
+                            local amt = tonumber(t[6])
+                            self.recipes[ind][x][2] = {tostring(t[5]), (amt > 4) and (amt - ach) or amt}
+                        else
+                            printe("! UIWorkshopCraft:LoadRecipes() | componenet section [%s] not found for [%s] recipe!", tostring(t[5]), id)
+                        end
+                    end
+                    if t[7] and t[8] then -- support item 3
+                        if ini_sys:section_exist(tostring(t[7])) then
+                            local amt = tonumber(t[8])
+                            self.recipes[ind][x][3] = {tostring(t[7]), (amt > 4) and (amt - ach) or amt}
+                        else
+                            printe("! UIWorkshopCraft:LoadRecipes() | componenet section [%s] not found for [%s] recipe!", tostring(t[7]), id)
+                        end
+                    end
+                    if t[9] and t[10] then -- support item 4
+                        if ini_sys:section_exist(tostring(t[9])) then
+                            local amt = tonumber(t[10])
+                            self.recipes[ind][x][4] = {tostring(t[9]), (amt > 4) and (amt - ach) or amt}
+                        else
+                            printe("! UIWorkshopCraft:LoadRecipes() | componenet section [%s] not found for [%s] recipe!", tostring(t[9]), id)
+                        end
+                    end
+                end
+            elseif (id ~= "tle") then
+                printe("! UIWorkshopCraft:LoadRecipes() | section [%s] not found!",id)
+            end
+        end
+
+        ind = ind + 1
+    end
+
+    --utils_data.print_table(self.recipes)
+    --utils_data.print_table(self.recipes_type)
+
+    for i=1,#self.recipes_type do
+        local _itm = ui_workshop.list_element(i, self.recipes_type[i])
+        self.list_menu:AddExistingItem(_itm)
+    end
+end
+
+
+local UIWorkshopCraft_UpdateItem = ui_workshop.UIWorkshopCraft.UpdateItem
+function ui_workshop.UIWorkshopCraft:UpdateItem(n, sec, amount, result, toolkit_idx, toolkit_sec)
+    local ammo = IsItem("ammo",sec)
+    ammo = ammo and (tonumber(ammo) or 1) or false
+    if (result or not ammo) then -- 'tonumber' due to anomaly dev monkeycoding
+        return UIWorkshopCraft_UpdateItem(self, n, sec, amount, result, toolkit_idx, toolkit_sec)
+    end
+
+    -- Text (Amount)
+    local box = ammo
+    local amt = math.floor(box * amount)
+
+    -- Text (Name)
+    local parts_id = {}
+    local name = ui_item.get_sec_name(sec)
+
+
+    -- Reset
+    self.craft_item[n] = {}
+    self.craft_item_remain[n] = {}
+    self.craft_allow[n] = false
+
+    self.itm_name[n]:SetText(name)
+    self.itm_num[n]:SetTextColor(GetARGB(250, 255, 50, 50)) --GetARGB(200, 255, 50, 20)
+
+    -- Collect valid items
+    local search = function(temp, item)
+        if (item:section() == sec) and (not parts_id[item:id()]) then
+            parts_id[item:id()] = item:ammo_get_count()
+        end
+    end
+    db.actor:iterate_inventory(search,nil)
+
+    -- Ammo boxes
+    local ammo_count = 0
+    for id,size in pairs(parts_id) do
+        local ammo = level.object_by_id(id)
+        if ammo then
+            ammo_count = ammo_count + size
+        end
+        if (ammo_count >= amt) then
+            self.itm_num[n]:SetTextColor(GetARGB(200, 50, 255, 50))
+            self.craft_allow[n] = true
+        end
+    end
+    self.itm_num[n]:SetText(tostring(ammo_count) .. "/" .. tostring(amt))
+
+    -- Store items id
+    local count = amt
+    for id,cnt in pairs(parts_id) do
+        if count <= 0 then break end
+        count = count - cnt
+        if count < 0 then -- parial use of a box
+            self.craft_item_remain[n] = { id = id , cnt = -count }
+        else -- full use
+            self.craft_item[n][#self.craft_item[n] + 1] = id
+        end
+    end
+
+    utils_xml.set_icon(sec, (not self.craft_allow[n]), self.itm_ico_temp[n], self.itm_ico[n])
+end
+
+
+function ui_workshop.UIWorkshopCraft:Craft()
+    if (not self.craft_allow_r) then
+        return
+    end
+
+    -- Remove supportive items
+    for i=1,#self.craft_item do
+        -- Release
+        if #self.craft_item[i] > 0 then
+            for j=1,#self.craft_item[i] do
+                alife_release_id(self.craft_item[i][j])
+            end
+        end
+
+        -- Discharge
+        local id_r = self.craft_item_remain[i].id
+        if id_r then
+            local obj_itm = level.object_by_id(id_r)
+            local cnt = self.craft_item_remain[i].cnt
+            if obj_itm and cnt then
+                ui_workshop.print_ws("- UIWorkshopCraft:Craft() | discharge item (%s) [%s] %s times", id_r, obj_itm:section(), cnt)
+                if IsItem('ammo', nil, obj_itm) then
+                    obj_itm:ammo_set_count(cnt)
+                else
+                    for _=1,(obj_itm:get_remaining_uses() - cnt) do
+                        utils_item.discharge(obj_itm)
+                    end
+                end
+            end
+        end
+    end
+
+    -- Craft
+    if IsItem("ammo",self.craft_item_r[1]) then
+        alife_create_item(self.craft_item_r[1], db.actor, {ammo = self.craft_item_r[2]})
+    else
+        for i = 1, self.craft_item_r[2] do
+            alife_create_item(self.craft_item_r[1], db.actor)
+        end
+    end
+
+    -- Increase Statistic
+    game_statistics.increment_statistic("items_crafted")
+
+    -- Effect
+    actor_effects.play_item_fx("craft_dummy")
+
+    if (zz_ui_workshop_keep_crafting_window_open) then
+        if (self.last_cont and self.last_idx) then
+            --Dirty hack to update ui after alife item removal
+            --Disable button and reenable later in update event
+            self.btn_craft:Enable(false)
+            CreateTimeEvent("totally_not_random_event" .. random_number(1, 1000000), "update_ui_delay" .. random_number(1, 1000000), 0.1, self.UpdateUi, self, self.last_cont, self.last_idx)
+        end
+    else self:Close() end
+end
