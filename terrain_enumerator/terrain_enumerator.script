@@ -1,0 +1,615 @@
+--[[
+    author: Oiltanker
+
+    Usage:
+     - do NOT create instances, class is a singelton
+     - use global instance 'TerEnum' (global variable)
+
+    In game:
+     - in debug mode press following keys:
+       - Numpad Enter    to enable debug rendering (particles at spawn points)
+       - Numpad +        to deisable debug rendering
+]]
+
+--[[
+    2D coordinate rule:
+     - fist 2  if x <  value.X
+     - last 2  if x >= value.X
+     - odd   if z <  value.Z
+     - even  if z >= value.Z
+    3D coordinate rule: -- not used !!
+     - fist 4  if x <  value.X
+     - last 4  if x >= value.X
+     - first and third pair (count cords by 2)   if y <  value.Y
+     - second and forth pair (count cords by 2)  if y >= value.Y
+     - odd   if z <  value.Z
+     - even  if z >= value.Z
+]]
+
+
+local io = require 'io'
+
+
+class 'TENode'
+function TENode:__init(vec, nodes, leaves)
+    self.vec = vec and vec or vector():set(0, 0, 0)
+    self.nodes = nodes and nodes or { nil, nil, nil, nil }
+    self.leaves = leaves and leaves or {}
+    self.indexes = {}
+
+    self.leafCount = 0
+    if #self.leaves > 0 then
+        self.leafCount = #self.leaves
+    else
+        for _,n in pairs(self.nodes) do
+            if n ~= nil then self.leafCount = self.leafCount + n.leafCount end
+        end
+    end
+end
+
+function TENode:setNode(idx, node)
+    if idx < 0 or idx > 4 then error('TENode | node index out of bounds') end
+    if node == nil then return end
+
+    local pNode = self.nodes[idx]
+    self.nodes[idx] = node
+    self.leafCount = self.leafCount - (pNode ~= nil and pNode.leafCount or 0) + node.leafCount
+end
+
+function TENode:getNext(vec) -- gets next node or leaves depending on the vector
+    if #self.nodes == 0 then return self end
+
+    local choiseX = vec.x >= self.vec.x
+    --local choiseY = vec.y >= self.vec.y
+    local choiseZ = vec.z >= self.vec.z
+
+    -- nested is more effective than set calculation?
+    local nodeIdx = 0
+
+    if choiseX and (
+        (self.nodes[3] and self.nodes[3].leafCount or 0) +
+        (self.nodes[4] and self.nodes[4].leafCount or 0)
+    ) > 0 then -- 3, 4
+        if choiseZ and (self.nodes[4] and self.nodes[4].leafCount or 0) > 0 then -- 4
+            nodeIdx = 4
+        else -- 3
+            nodeIdx = 3
+        end
+    else -- 1, 2
+        if choiseZ and (self.nodes[2] and self.nodes[24].leafCount or 0) > 0 then -- 2
+            nodeIdx = 2
+        else -- 1
+            nodeIdx = 1
+        end
+    end
+
+    return self.nodes[nodeIdx]
+end
+
+class 'TerrainEnumerator'
+function TerrainEnumerator:__init()
+    self.currentLevel = nil
+    self.isLevelLoaded = false
+    self.sampleStep = 3
+
+    self.debugRender = false
+    self.debugParticles = {}
+    self.debugPFreq = 0.5 -- in seconds
+
+    self.pointFile = '_te_caches\\points_'
+    self.treeFile = '_te_caches\\tree_'
+
+    self.spawns = {}
+    self.cordTree = nil
+end
+
+-- Methods
+function TerrainEnumerator:enumLevel(reEnum) -- enumerates current level
+    reEnum = reEnum and true or false -- force boolean
+    if not reEnum and (self.currentLevel == level.name() or self:loadLvlCfg(level.name())) then
+        self.currentLevel = level.name()
+        return
+    end
+
+    self.currentLevel = level.name()
+    self.spawns = {}
+
+    -- setup
+    local bbMin = level.get_bounding_volume().min
+    local bbMax = level.get_bounding_volume().max
+
+    local y_lvls = {
+        bbMax.y,
+        (bbMax.y + bbMin.y) / 2,
+        bbMin.y
+    }
+
+    -- enumeration (at least some freeze guaranteed)
+    local vCount = 0
+    local vTotal = 0
+    local memGorging = {}
+    local genStack = {{
+        min = level.get_bounding_volume().min,
+        max = level.get_bounding_volume().max,
+        cc = function(n) self.cordTree = n end
+    }}
+    local ccStack = {}
+    local function treePass(genElem)
+        local minB = genElem.min
+        local maxB = genElem.max
+
+        local vec = vector():set((maxB.x + minB.x) / 2, 0, (maxB.z + minB.z) / 2)
+        local leaves = {}
+        if (maxB.x - minB.x) <= self.sampleStep * 2 and (maxB.z - minB.z) <= self.sampleStep * 2 then -- generate leaves
+            for _,y in ipairs(y_lvls) do
+                for x=0,1 do
+                    for z=0,1 do
+                        vTotal = vTotal + 1
+                        local pos = vector():set(minB.x  + (x * self.sampleStep), y, minB.z + (z * self.sampleStep))
+
+                        local lvid = level.vertex_id(pos)
+                        if lvid > 0 then
+                            pos = level.vertex_position(lvid) -- set to level vertex position
+
+                            if math.abs(pos.x) + math.abs(pos.y) + math.abs(pos.z) > 0.1 then -- to high eps? well false negative <<< false positive
+                                local duplicate = false
+
+                                local function round(x)
+                                    local floor = math.floor(x)
+                                    if (x - floor) >= 0.5 then return floor
+                                    else return math.ceil(x) end
+                                end
+                                local ofX = round(pos.x * 10) / 10
+                                local ofY = round(pos.y * 10) / 10
+                                local ofZ = round(pos.z * 10) / 10
+                                local ofStr = table.concat({ofX, ofY, ofZ}, '|')
+                                if memGorging[ofStr] then duplicate = true
+                                else memGorging[ofStr] = true end
+
+                                if not duplicate then
+                                    vCount = vCount + 1 -- count valid
+                                    table.insert(self.spawns, { lvid = lvid, pos = pos })
+                                    table.insert(leaves, #self.spawns)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if #leaves > 0 then genElem.cc(TENode(vec, nil, leaves))
+            else genElem.cc(nil) end
+        else -- generate nodes
+            local node = TENode(vec, nil, nil)
+            table.insert(ccStack, { cc = genElem.cc, val = node })
+
+            table.insert(genStack, { min = vector():set(minB.x, 0, minB.z), max = vector():set(vec.x, 0, vec.z), cc = function(n) node:setNode(1, n) end })
+            table.insert(genStack, { min = vector():set(minB.x, 0, vec.z), max = vector():set(vec.x, 0, maxB.z), cc = function(n) node:setNode(2, n) end })
+            table.insert(genStack, { min = vector():set(vec.x, 0, minB.z), max = vector():set(maxB.x, 0, vec.z), cc = function(n) node:setNode(3, n) end })
+            table.insert(genStack, { min = vector():set(vec.x, 0, vec.z), max = vector():set(maxB.x, 0, maxB.z), cc = function(n) node:setNode(4, n) end })
+        end
+    end
+    while #genStack > 0 do
+        local genElem = genStack[1]
+        table.remove(genStack, 1)
+        treePass(genElem)
+    end
+    -- back-propagete
+    for i=0,#ccStack-1 do
+        local node = ccStack[#ccStack - i].val
+        if node.leafCount > 0 then
+            if #node.leaves == 0 then -- middle node
+                local nCount = 0
+                local lIdx = 0
+                for j,n in pairs(node.nodes) do -- check if has single child
+                    if n ~= nil then
+                        lIdx = j
+                        nCount = nCount + 1
+                    end
+                end
+                if nCount > 1 then ccStack[#ccStack - i].cc(node) -- return node
+                else -- return child node as self
+                    local rNode = node.nodes[lIdx]
+                    rNode.vec = node.vec
+                    ccStack[#ccStack - i].cc(rNode)
+                end
+            else -- terminal node
+                ccStack[#ccStack - i].cc(node)
+            end
+        else ccStack[#ccStack - i].cc(nil) end
+    end
+    ccStack = nil
+    memGorging = nil -- free memory?
+
+    -- log stats
+    log('TerrainEnumerator | valid spawns: ' .. tostring(vCount) .. ' / ' .. tostring(vTotal))
+
+    -- save in config
+    self:saveLvlCfg()
+end
+
+local function _read_cache(pos, cache)
+    --[[local size = string.byte(string.sub(cache, pos, pos))
+    if size then return pos + 1 + size + 1, string.sub(cache, pos + 1, pos + 1 + size)
+    else return #cache + 1, nil end]] -- needs LUA >= 5.2
+    local nPos = string.find(cache, '\0', pos)
+    if nPos then return nPos + 1, string.sub(cache, pos, nPos - 1)
+    else return #cache + 1, nil end
+end
+local function cacheIterator(cache)
+    local i = 1
+    local read = nil
+    return function()
+        i, read = _read_cache(i, cache)
+        if read then return read
+        else return nil end
+    end
+end
+
+CParser = {}
+function CParser.parse(fmt, cv)
+    if fmt == 'b' then
+        return string.byte(cv)
+    elseif fmt == 'n' or fmt =='i' or fmt == 'f' then
+        return tonumber(cv)
+    elseif fmt == 's' then
+        return cv
+    else
+        error('CachseParser | FORMAT ERROR: wrong or absent format value')
+    end
+end
+
+function TerrainEnumerator:_parsePointsCache(cache)
+    local pos = {}
+    local lvid = nil
+
+    local state = nil
+    for read in cacheIterator(cache) do
+        if not state then
+            local bVal = CParser.parse('b', read)
+            if bVal == 1 then -- new entry
+                state = nil
+                if lvid then -- create if previuos exists
+                    if #pos == 3 then
+                        table.insert(self.spawns, {
+                            lvid = lvid,
+                            pos = vector():set(pos[1], pos[2], pos[3])
+                        })
+                        pos = {}
+                        lvid = nil
+                    else -- format error
+                        log('TerrainEnumerator | LOAD ERROR: points file format error - malformed entry.')
+                        self.spawns = {}
+                        return false
+                    end
+                end
+            elseif bVal == 2 then -- position number
+                state = 2
+            elseif bVal == 3 then -- level vertex id
+                state = 3
+            else -- format error
+                log('TerrainEnumerator | LOAD ERROR: points file format error - unkwnon symbol \\' .. bVal .. '.')
+                self.spawns = {}
+                return false
+            end
+        else
+            if state == 2 then
+                state = nil
+                table.insert(pos, CParser.parse('f', read))
+            elseif state == 3 then
+                state = nil
+                lvid = CParser.parse('i', read)
+            else
+                log('TerrainEnumerator | LOAD ERROR: points file format error - malformed file.')
+                self.spawns = {}
+                return false
+            end
+        end
+    end
+
+    return true
+end
+
+function TerrainEnumerator:_parseTreeCache(cache)
+    local nodes = {}
+
+    local id = nil
+    local pos = {}
+    local nodeIds = {}
+    local leafIds = {}
+
+    local state = nil
+    for read in cacheIterator(cache) do
+        if not state then
+            local bVal = CParser.parse('b', read)
+            if bVal == 1 then -- new entry
+                state = nil
+                if id then -- create if previuos exists
+                    if #pos == 3 and (#nodeIds > 0 or #leafIds > 0) then
+                        nodes[id] = {
+                            pos = vector():set(pos[1], pos[2], pos[3]),
+                            nodeIds = nodeIds,
+                            leafIds = leafIds
+                        }
+                        id = nil
+                        pos = {}
+                        nodeIds = {}
+                        leafIds = {}
+                    else -- format error
+                        log('TerrainEnumerator | LOAD ERROR: tree file format error - malformed entry.')
+                        log('Offending entry:\nid: ' .. id ..
+                            '\nvector: [ ' .. table.concat(pos, ', ') ..
+                            ' ]\nchild ids: [ ' .. table.concat(nodeIds, ', ') ..
+                            ' ]\nleaf ids: [ ' .. table.concat(leafIds, ', ') .. ' ]\n'
+                        )
+                        self.spawns = {}
+                        return nil
+                    end
+                end
+            elseif bVal == 2 then -- node id
+                state = 2
+            elseif bVal == 3 then -- position number
+                state = 3
+            elseif bVal == 4 then -- child node id
+                state = 4
+            elseif bVal == 5 then -- leaf id
+                state = 5
+            else -- format error
+                log('TerrainEnumerator | LOAD ERROR: tree file format error - unkwnon symbol \\' .. bVal .. '.')
+                self.spawns = {}
+                return nil
+            end
+        else
+            if state == 2 then
+                state = nil
+                id = CParser.parse('i', read)
+            elseif state == 3 then
+                state = nil
+                table.insert(pos, CParser.parse('f', read))
+            elseif state == 4 then
+                state = nil
+                table.insert(nodeIds, CParser.parse('i', read))
+            elseif state == 5 then
+                state = nil
+                table.insert(leafIds, CParser.parse('i', read))
+            else
+                log('TerrainEnumerator | LOAD ERROR: tree file format error - malformed file.')
+                self.spawns = {}
+                return nil
+            end
+        end
+    end
+
+    return nodes
+end
+
+function TerrainEnumerator:loadLvlCfg(lvlName)
+    local pointFile = io.open(self.pointFile .. lvlName, 'rb')
+    local treeFile = io.open(self.treeFile .. lvlName, 'rb')
+
+    if not pointFile or not treeFile then return false end
+
+    -- reading spawns
+    if not self:_parsePointsCache(pointFile:read('*all')) then return false end
+    pointFile:close()
+
+    -- reading tree
+    local nodes = self:_parseTreeCache(treeFile:read('*all'))
+    if not nodes then return false end
+    treeFile:close()
+
+    -- recostruct tree
+    local recStack = { { node = nodes[1], cc = function(n) self.cordTree = n end } }
+    local ccStack = {} -- tree root
+    local calcNode = function(recElem)
+        local node = recElem.node
+        if #node.nodeIds then
+            local ret = TENode(node.pos, nil, nil)
+            for i,nId in ipairs(node.nodeIds) do
+                if not nodes[nId] then
+                    log('TerrainEnumerator | TREE ERROR: broken node reference')
+                    return false
+                end
+                table.insert(recStack, {
+                    node = nodes[nId],
+                    cc = function(n) ret:setNode(i, n) end
+                })
+            end
+            table.insert(ccStack, { cc = recElem.cc, val = ret })
+        else
+            for _,lId in ipairs(node.leafIds) do -- just check
+                if not self.spawns[lId] then
+                    log('TerrainEnumerator | TREE ERROR: broken point reference')
+                    return false
+                end
+            end
+            recElem.cc(TENode(node.pos, nil, node.leafIds))
+        end
+        return true
+    end
+    while #recStack > 0 do
+        local recElem = recStack[1]
+        table.remove(recStack, 1)
+        if not calcNode(recElem) then
+            self.spawns = {}
+            return false
+        end
+    end
+    -- back-propagete
+    for i=0,#ccStack-1 do
+        local node = ccStack[#ccStack - i].val
+        ccStack[#ccStack - i].cc(node)
+    end
+
+    if not self.cordTree then -- broken tree structure
+        log('TerrainEnumerator | LOAD ERROR: broken tree structure.')
+        self.spawns = {}
+        return false
+    end
+
+    return true
+end
+
+local function fileWriter(file)
+    return { write = function(val, isByte)
+        if not isByte then file:write(val)
+        else file:write(string.char(val)) end
+        file:write(string.char(0))
+    end }
+end
+
+function TerrainEnumerator:saveLvlCfg()--allLevels)
+    if not self.spawns or not self.cordTree then
+        log('TerrainEnumerator | GENERATION ERROR: failed to generate spawns or an index tree')
+        return
+    end
+
+    local lvlName = level.name()
+    local pointFile = io.open(self.pointFile .. lvlName, 'w+b')
+    local treeFile = io.open(self.treeFile .. lvlName, 'w+b')
+
+    if not pointFile or not treeFile then
+        error('TerrainEnumerator | SAVE ERROR: could not create files')
+        return
+    end
+
+    -- wrire points
+    local fw = fileWriter(pointFile)
+    for i=1,#self.spawns do
+        local sp = self.spawns[i]
+        fw.write(1, true) -- new entry
+
+        fw.write(2, true) -- position x
+        fw.write(sp.pos.x)
+        fw.write(2, true) -- position y
+        fw.write(sp.pos.y)
+        fw.write(2, true) -- position z
+        fw.write(sp.pos.z)
+
+        fw.write(3, true) -- level vertex id
+        fw.write(sp.lvid)
+    end
+
+    pointFile:close()
+
+    -- wrtite tree
+    local callStack = {}
+    fw = fileWriter(treeFile)
+    local function writeNode(node, idx)
+        fw.write(1, true) -- new entry
+
+        fw.write(2, true) -- node id
+        fw.write(idx)
+
+        fw.write(3, true) -- position x
+        fw.write(node.vec.x)
+        fw.write(3, true) -- position y
+        fw.write(node.vec.y)
+        fw.write(3, true) -- position z
+        fw.write(node.vec.z)
+
+        for i,n in pairs(node.nodes) do
+            if n ~= nil then
+                fw.write(4, true)
+                fw.write(idx + i)
+            end
+        end
+
+        for i=1,#node.leaves do
+            fw.write(5, true)
+            fw.write(node.leaves[i])
+        end
+
+        for i,n in pairs(node.nodes) do
+            if n ~= nil then
+                table.insert(callStack, { node = n, idx = idx + i })
+            end
+        end
+    end
+    table.insert(callStack, { node = self.cordTree, idx = 1 })
+    while #callStack > 0 do
+        local csElem = callStack[1]
+        table.remove(callStack, 1)
+        writeNode(csElem.node, csElem.idx)
+    end
+
+    treeFile:close()
+end
+
+function TerrainEnumerator:getClosest(vec) -- get closest spawn position to a vector
+    if not self.cordTree then return nil end
+
+    local node = self.cordTree
+    local next = node:getNext(vec)
+    while node ~= next do
+        node = next
+        next = node:getNext(vec)
+    end
+
+    local minDist = 999999
+    local minIdx = 0
+    for _,l in ipairs(node.leaves) do
+        local dist = math.sqrt(
+            (self.spawns[l].pos.x - vec.x) ^ 2 +
+            (self.spawns[l].pos.y - vec.y) ^ 2 +
+            (self.spawns[l].pos.z - vec.z) ^ 2
+        )
+        if minDist > dist then
+            minDist = dist
+            minIdx = l
+        end
+    end
+
+    return self.spawns[minIdx]
+end
+
+-- Debug generated spawn points
+function TerrainEnumerator:debugShowParticles()
+    if not self.debugRender then return true
+    else ResetTimeEvent("spawn_particle_update", "spawn_particle_update", self.debugPFreq) end
+
+
+    if #self.spawns ~= #self.debugParticles then
+        self.debugParticles = {}
+        for i=1,#self.spawns do
+            --_samples_particles_\glow_01
+            --_samples_particles_\glow_03
+            --anomaly2\effects\a_test_glow
+            self.debugParticles[i] = particles_object([[anomaly2\effects\a_test_glow]])
+        end
+    end
+
+    for i=1,#self.spawns do
+        if self.debugParticles[i]:playing() then self.debugParticles[i]:stop() end
+        self.debugParticles[i]:play_at_pos(self.spawns[i].pos)
+    end
+end
+
+-- Callbacks
+function TerrainEnumerator:CC_OnLevelLoaded() -- terain and stuff
+    self.isLevelLoaded = true
+    self:enumLevel()
+end
+
+function TerrainEnumerator:CC_OnBeforeLevelChanging()
+    self.debugRender = false
+    self.isLevelLoaded = false
+end
+
+function TerrainEnumerator:CC_OnKeyPress(key)
+    if not DEV_DEBUG then return end
+
+    if key == DIK_keys.DIK_NUMPADENTER then
+        self.debugRender = true
+        CreateTimeEvent('spawn_particle_update', 'spawn_particle_update', self.debugPFreq, self.debugShowParticles, self)
+    elseif key == DIK_keys.DIK_ADD then
+        self.debugRender = false
+    end
+end
+
+_G.TerEnum = TerrainEnumerator()
+
+function on_game_start()
+    RegisterScriptCallback('on_key_press', function(key) TerEnum:CC_OnKeyPress(key) end)
+    RegisterScriptCallback('actor_on_first_update', function() TerEnum:CC_OnLevelLoaded() end)
+    RegisterScriptCallback('on_before_level_changing', function() TerEnum:CC_OnBeforeLevelChanging() end)
+end
