@@ -107,8 +107,8 @@ _G.TEDecision = {
     Right   = 4, -- check node's right child
 }
 
-DefaultPointGap   = 3
-DefaultChunkShize = 6
+DefaultPointDiv   = 200
+DefaultChunkShize = 2
 
 
 local function fileWriter(file)
@@ -169,7 +169,7 @@ end
 
 
 -- pre-made queries
-function TENumberQuery(min, max) -- both optional, then all leaves will be selected, DO NOT use that to get all leaves, use `TerEnum.spawns` instead
+_G.TENumberQuery = function(min, max) -- both optional, then all leaves will be selected, DO NOT use that to get all leaves, use `TerEnum.spawns` instead
     min = min and min or -math.huge
     max = max and max or math.huge
 
@@ -191,7 +191,7 @@ function TENumberQuery(min, max) -- both optional, then all leaves will be selec
     end
 end
 
-function TEStringQuery(patternNode, patternLeaf) -- patternLeaf optional, default same as patternNode, patternNode defaults to empty string match if not provided
+_G.TEStringQuery = function(patternNode, patternLeaf) -- patternLeaf optional, default same as patternNode, patternNode defaults to empty string match if not provided
     patternNode = patternNode and patternNode or '^$'
     patternLeaf = patternLeaf and patternLeaf or patternNode
 
@@ -212,6 +212,7 @@ end
 
 -- TESpawn class
 class 'TESpawn'
+_G.TESpawn = TESpawn
 function TESpawn:__init(pos, lvid)
     self.pos = pos
     self.lvid = lvid
@@ -220,6 +221,7 @@ end
 
 -- TEIdxNode class
 class 'TEIdxNode'
+_G.TEIdxNode = TEIdxNode
 function TEIdxNode:__init(value, left, right)
     self.value = value
     self.left = left
@@ -233,6 +235,7 @@ end
 
 -- TEIdxTemplate class
 class 'TEIdxTemplate'
+_G.TEIdxTemplate = TEIdxTemplate
 function TEIdxTemplate:__init(evalLeaf, decideValue, packValue, unpackValue) -- (required, required, optional, optional)
     self.evalLeaf = evalLeaf -- (sp: TESpawn) -> <index_value> | evaluete index value of the leaf
     self.decideValue = decideValue -- (a: <index_value>, b: <index_value>) -> bool | decide order of the leaf index (e.g. < operator for integers)
@@ -246,7 +249,10 @@ end
 
 -- TEIdxTree class
 class 'TEIdxTree'
+_G.TEIdxTree = TEIdxTree
 function TEIdxTree:__init(teIdxTemplate, leaves, filePath)
+    if #leaves == 0 then error('TEIdxTree | leaves list must not be empty') end
+
     self.teIdxTemplate = teIdxTemplate
     self.leaves = leaves
     self.filePath = filePath
@@ -270,6 +276,7 @@ function TEIdxTree:buildTree()
         }
     end
     table.sort(leafIndexValues, function(a, b) return self.teIdxTemplate.decideValue(a.val, b.val) end)
+    if #self.leaves ~= #leafIndexValues then error('lua sort fail again') end
 
     -- build tree using a queue
     local queue = { { l = 1, r = #leafIndexValues, cc = function(n) self.root = n end } }
@@ -365,7 +372,11 @@ end
 
 function TEIdxTree:load(filePath)
     local file = io.open(filePath, 'rb')
-    if not file then return false end
+    if not file then
+        log('TEIdxTree | No cache ' .. filePath .. ', bulding tree')
+        return false
+    end
+    log('TEIdxTree | Loading ' .. filePath)
 
     local cache = file:read('*all')
     if #cache == 0 then
@@ -459,6 +470,7 @@ end
 
 -- TEChunk class
 class 'TEChunk'
+_G.TEChunk = TEChunk
 function TEChunk:__init(spawns) -- (spawns: TESpawn[]) | only those that belong to this chunk
     self.spawns = spawns
 end
@@ -478,15 +490,17 @@ end
 
 -- TEChunkTable class
 class 'TEChunkMap'
-function TEChunkMap:__init(spawns, size) -- (spawns: TESpawn[], chunkSize: int) | all spawns and chunk size to devide them into
-    self.size = size and size or DefaultChunkShize
+_G.TEChunkMap = TEChunkMap
+function TEChunkMap:__init(spawns, sizeX, sizeZ) -- (spawns: TESpawn[], chunkSize: int) | all spawns and chunk size to devide them into
+    self.sizeX = sizeX and sizeX or DefaultChunkShize
+    self.sizeZ = sizeZ and sizeZ or DefaultChunkShize
     self.chunks = {}
     self.min_x, self.max_x = math.huge, -math.huge
     self.min_z, self.max_z = math.huge, -math.huge
 
     for _, sp in ipairs(spawns) do
-        local x = math.floor(sp.pos.x / size)
-        local z = math.floor(sp.pos.z / size)
+        local x = math.floor(sp.pos.x / self.sizeX)
+        local z = math.floor(sp.pos.z / self.sizeZ)
         self.min_x, self.max_x = math.min(self.min_x, x), math.max(self.max_x, x)
         self.min_z, self.max_z = math.min(self.min_z, z), math.max(self.max_z, z)
         if self.chunks[x] == nil then self.chunks[x] = {} end
@@ -496,8 +510,8 @@ function TEChunkMap:__init(spawns, size) -- (spawns: TESpawn[], chunkSize: int) 
 end
 
 function TEChunkMap:closest(pos) -- (pos: vector) -> TESpawn | returns closest point
-    local x = math.floor(pos.x / self.size)
-    local z = math.floor(pos.z / self.size)
+    local x = math.floor(pos.x / self.sizeX)
+    local z = math.floor(pos.z / self.sizeZ)
     for i = 0, math.max(self.max_x - self.min_x, self.max_z - self.min_z) do
         for dx = math.max(-i, self.min_x), math.min(i, self.max_x) do
             for dz = math.max(-i, self.min_z), math.min(i, self.max_z) do
@@ -514,18 +528,18 @@ function TEChunkMap:closest(pos) -- (pos: vector) -> TESpawn | returns closest p
 end
 
 function TEChunkMap:chunk(pos)
-    local x = math.floor(pos.x / self.size)
-    local z = math.floor(pos.z / self.size)
+    local x = math.floor(pos.x / self.sizeX)
+    local z = math.floor(pos.z / self.sizeZ)
     return self.chunks[x] and self.chunks[x][z]
 end
 
 -- TerrainEnumerator class
 class 'TerrainEnumerator'
-function TerrainEnumerator:__init(sampleStep)
+function TerrainEnumerator:__init(sample)
     self.currentLevel = nil
     self.isLevelLoaded = false
-    self.sampleStep = sampleStep and sampleStep or DefaultPointGap
-    self._chunkSize = sampleStep and sampleStep * 2 or DefaultChunkShize
+    self.sample = sample and sample or DefaultPointDiv
+    self._chunkSize = DefaultChunkShize
 
     self.debugRender = false
     self.debugParticles = {}
@@ -614,12 +628,12 @@ function TerrainEnumerator:enumLevel(reEnum) -- enumerates current level
     local vTotal = 0
 
     local memGorging = {}
-    local iterX, iterZ = math.floor((bbMax.x - bbMin.x) / self.sampleStep - 1), math.floor((bbMax.z - bbMin.z) / self.sampleStep - 1)
+    local iterX, iterZ = math.max(math.floor((bbMax.x - bbMin.x) / self.sample), 1), math.max(math.floor((bbMax.z - bbMin.z) / self.sample), 1)
     for _,y in ipairs(y_lvls) do
-        for x=0,iterX do
-            for z=0,iterZ do
+        for x=0,math.floor((bbMax.x - bbMin.x) / iterX) do
+            for z=0,math.floor((bbMax.z - bbMin.z) / iterZ) do
                 vTotal = vTotal + 1
-                local pos = vector():set(bbMin.x  + (x * self.sampleStep), y, bbMin.z + (z * self.sampleStep))
+                local pos = vector():set(bbMin.x  + (x * iterX), y, bbMin.z + (z * iterZ))
 
                 local lvid = level.vertex_id(pos)
                 if lvid > 0 then
@@ -653,7 +667,10 @@ function TerrainEnumerator:enumLevel(reEnum) -- enumerates current level
 
     -- log stats & bild map
     log('TerrainEnumerator | valid spawns: ' .. tostring(vCount) .. ' / ' .. tostring(vTotal))
-    self.map = TEChunkMap(self.spawns, self._chunkSize)
+    self.map = TEChunkMap(self.spawns, iterX * 2, iterZ * 2)
+
+    -- save in config
+    self:saveLvlCfg()
 
     -- calculate indexes
     for name,_ in pairs(self.idxTemplates) do
@@ -661,12 +678,11 @@ function TerrainEnumerator:enumLevel(reEnum) -- enumerates current level
         local fileName = self.idxTemplates[name]:canCache() and self.cacheDist .. name .. '_' .. self.currentLevel or nil
         self.idxTrees[name] = TEIdxTree(self.idxTemplates[name], self.spawns, fileName)
     end
-
-    -- save in config
-    self:saveLvlCfg()
 end
 
 function TerrainEnumerator:_parsePointsCache(cache)
+    local sizeX, sizeZ
+
     local pos = {}
     local lvid = nil
 
@@ -684,17 +700,21 @@ function TerrainEnumerator:_parsePointsCache(cache)
                     else -- format error
                         log('TerrainEnumerator | LOAD ERROR: points file format error - malformed entry.')
                         self.spawns = {}
-                        return false
+                        return nil
                     end
                 end
             elseif bVal == 2 then -- position number
                 state = 2
             elseif bVal == 3 then -- level vertex id
                 state = 3
+            elseif bVal == 4 then -- chunk sizeX
+                state = 4
+            elseif bVal == 5 then -- chunk sizeZ
+                state = 5
             else -- format error
                 log('TerrainEnumerator | LOAD ERROR: points file format error - unkwnon symbol \\' .. bVal .. '.')
                 self.spawns = {}
-                return false
+                return nil
             end
         else
             if state == 2 then
@@ -703,20 +723,27 @@ function TerrainEnumerator:_parsePointsCache(cache)
             elseif state == 3 then
                 state = nil
                 lvid = CParser.parse('i', read)
+            elseif state == 4 then
+                state = nil
+                sizeX = CParser.parse('i', read)
+            elseif state == 5 then
+                state = nil
+                sizeZ = CParser.parse('i', read)
             else
                 log('TerrainEnumerator | LOAD ERROR: points file format error - malformed file.')
                 self.spawns = {}
-                return false
+                return nil
             end
         end
     end
 
-    return true
+    return sizeX, sizeZ
 end
 
 function TerrainEnumerator:loadLvlCfg(lvlName)
     self.spawns = {}
     self.idxTrees = {}
+    self.currentLevel = level.name()
 
     local pointFile = io.open(self.pointFile .. lvlName, 'rb')
     if not pointFile then return false end
@@ -728,8 +755,11 @@ function TerrainEnumerator:loadLvlCfg(lvlName)
         return false
     end
     pointFile:close()
-    if not self:_parsePointsCache(pCache) then return false end
-    self.map = TEChunkMap(self.spawns, self._chunkSize)
+    local csX, csZ = self:_parsePointsCache(pCache)
+    if csX == nil or csZ == nil then
+        return false
+    end
+    self.map = TEChunkMap(self.spawns, csX, csZ)
 
     -- load indexes
     for name,_ in pairs(self.idxTemplates) do
@@ -742,22 +772,33 @@ function TerrainEnumerator:loadLvlCfg(lvlName)
 end
 
 function TerrainEnumerator:saveLvlCfg()
+    log('TerrainEnumerator | Saving spawn point cache.')
     if not self.spawns then
-        log('TerrainEnumerator | GENERATION ERROR: failed to generate spawns or an index tree')
+        log('TerrainEnumerator | GENERATION ERROR: failed to generate spawns or an index tree.')
         return
     end
 
-    local lvlName = level.name()
+    local lvlName = self.currentLevel
     local pointFile = io.open(self.pointFile .. lvlName, 'w+b')
 
     if not pointFile then
-        error('TerrainEnumerator | SAVE ERROR: could not create files')
+        log('TerrainEnumerator | SAVE ERROR: could not create files.')
         return
     end
 
     -- wrire points
     local fw = fileWriter(pointFile)
+
+    log('   -- sizeX')
+    fw.write(4, true) -- chunk sizeX
+    fw.write(self.map.sizeX)
+
+    log('   -- sizeZ')
+    fw.write(5, true) -- chunk sizeZ
+    fw.write(self.map.sizeZ)
+
     for i=1,#self.spawns do
+        log('   -- point')
         local sp = self.spawns[i]
         fw.write(1, true) -- new entry
 
@@ -824,7 +865,7 @@ function TerrainEnumerator:CC_OnKeyPress(key)
 end
 
 _G.TerEnum = TerrainEnumerator()
-TerEnum:addIndex('random', TEIdxTemplate(
+--[[TerEnum:addIndex('random', TEIdxTemplate(
     function(sp)   -- evalLeaf     (sp: TESpawn) -> <index_value> | evaluete index value of the leaf
         return math.random()
     end,
@@ -837,7 +878,7 @@ TerEnum:addIndex('random', TEIdxTemplate(
     function(val)  -- unpackValue  (val: string) -> <index_value> | unpack saved string to a index value
         return tonumber(val)
     end
-))
+))]]
 
 function on_game_start()
     RegisterScriptCallback('on_key_press', function(key) TerEnum:CC_OnKeyPress(key) end)
