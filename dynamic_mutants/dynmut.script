@@ -17,6 +17,10 @@ logicParams = {
     nonAggressive = <boolean> -- (default: false) turns mob completely non-aggressive
 }
 
+Callbacks:
+ - 'dynmut_on_save' (mobSt: <mob_entry_storage>, state: <alife_store_mngr_obj_state>) - called after mob is saved
+ - 'dynmut_on_load' (mobSt: <mob_entry_storage>, state: <alife_store_mngr_obj_state>) - called after mob is loaded
+
 ]]
 
 
