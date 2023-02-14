@@ -3,7 +3,7 @@
 
     Usage:
      - do NOT create instances, class is a singelton
-     - use global instance 'TerEnum' (global variable)
+     - use global instance 'TerEnum' (global variable) or 'terrain_enumerator.Require()' to explicitly load script before yours
 
     In game:
      - in debug mode press following keys:
@@ -111,6 +111,12 @@ DefaultPointDiv   = 200
 DefaultChunkShize = 2
 
 
+local _actor = nil
+local function getGvid()
+    return _actor.m_game_vertex_id
+end
+
+
 local function fileWriter(file)
     return { write = function(val, isByte)
         if not isByte then file:write(val)
@@ -213,11 +219,11 @@ end
 -- TESpawn class
 class 'TESpawn'
 _G.TESpawn = TESpawn
-function TESpawn:__init(pos, lvid)
-    self.pos = pos
+function TESpawn:__init(lvid)
+    self.pos = level.vertex_position(lvid)
     self.lvid = lvid
+    self.gvid = getGvid()
 end
-
 
 -- TEIdxNode class
 class 'TEIdxNode'
@@ -306,8 +312,8 @@ function TEIdxTree:queryTree(query) -- (query: function(TEIdxNode) -> TEDecision
     local loop = function(node)
         if not node:isLeaf() then
             local decision = query(node)
-            if decision == TEDecision.All or decision == TEDecision.Left then table.insert(node.left) end
-            if decision == TEDecision.All or decision == TEDecision.Right then table.insert(node.right) end
+            if decision == TEDecision.All or decision == TEDecision.Left then table.insert(queue, node.left) end
+            if decision == TEDecision.All or decision == TEDecision.Right then table.insert(queue, node.right) end
         else
             if query(node) == TEDecision.Select then
                 table.insert(leafs, self.leaves[node.leafId])
@@ -475,17 +481,17 @@ function TEChunk:__init(spawns) -- (spawns: TESpawn[]) | only those that belong 
     self.spawns = spawns
 end
 
-function TEChunk:closest(pos) -- returns closest point
+function TEChunk:closest(pos) -- returns closest point and distance
     local minDist = math.huge
     local res = nil
     for _,sp in ipairs(self.spawns) do
-        local dist = math.sqrt((sp.pos.x - pos.x)^2 + (sp.pos.y - pos.y)^2 + (sp.pos.z - pos.z)^2)
+        local dist = pos:distance_to(sp.pos)--math.sqrt((sp.pos.x - pos.x)^2 + (sp.pos.y - pos.y)^2 + (sp.pos.z - pos.z)^2)
         if minDist > dist then
             minDist = dist
             res = sp
         end
     end
-    return res
+    return res, minDist
 end
 
 -- TEChunkTable class
@@ -509,20 +515,37 @@ function TEChunkMap:__init(spawns, sizeX, sizeZ) -- (spawns: TESpawn[], chunkSiz
     end
 end
 
+local function seq(min, max)
+    local i,step = min, (max > min and 1 or -1)
+    local stop = max + step
+    return function()
+        local res = i
+        i = i + step
+        if res ~= stop then return res end
+    end
+end
 function TEChunkMap:closest(pos) -- (pos: vector) -> TESpawn | returns closest point
     local x = math.floor(pos.x / self.sizeX)
     local z = math.floor(pos.z / self.sizeZ)
     for i = 0, math.max(self.max_x - self.min_x, self.max_z - self.min_z) do
-        for dx = math.max(-i, self.min_x), math.min(i, self.max_x) do
-            for dz = math.max(-i, self.min_z), math.min(i, self.max_z) do
-                local cx, cz = x + dx, z + dz
-                local chunk = self.chunks[cx] and self.chunks[cx][cz]
-                if chunk then
-                    local closest = chunk:closest(pos)
-                    if closest then return closest end
-                end
+        local chunks = {}
+        if i ~= 0 then
+            for iX in seq(-i, i) do table.insert(chunks, self.chunks[x+iX] and self.chunks[x+iX][z-i]) end
+            for iZ in seq(-i+1, i) do table.insert(chunks, self.chunks[x+i] and self.chunks[x+i][z+iZ]) end
+            for iX in seq(i-1, -i) do table.insert(chunks, self.chunks[x+iX] and self.chunks[x+iX][z+i]) end
+            for iZ in seq(i-1, -i+1) do table.insert(chunks, self.chunks[x-i] and self.chunks[x-i][z+iZ]) end
+        else chunks = { self.chunks[x][z] } end
+
+        local dist = math.huge
+        local closest = nil
+        for _,chunk in ipairs(chunks) do
+            local cSp, cDist = chunk:closest(pos)
+            if cDist < dist then
+                dist = cDist
+                closest = cSp
             end
         end
+        if closest then return closest end
     end
     return nil
 end
@@ -546,7 +569,7 @@ function TerrainEnumerator:__init(sample)
     self.debugPFreq = 0.5 -- in seconds
 
     -- cacheFiles
-    self.cacheDist = '_te_caches\\'
+    self.cacheDist = getFS():update_path('$game_config$', '') .. '_te_caches\\'
     self.pointFile = self.cacheDist .. 'points_'
 
     -- spawns and r-tree
@@ -556,9 +579,19 @@ function TerrainEnumerator:__init(sample)
     -- indexation
     self.idxTemplates = {}
     self.idxTrees = {}
+
+    -- callbacks
+    self.callbacks = {
+        onReady = {},
+        onLvlChange = {}
+    }
 end
 
 -- Methods
+function TerrainEnumerator:isReady()
+    return self.isLevelLoaded == true and self.currentLevel ~= nil
+end
+
 function TerrainEnumerator:addIndex(name, teIdxTemplate) -- errors because it's addon development / installation level incompatibility
     if string.find(name, '[^%a%d_]') ~= nil then
         error('TerrainEnumerator | INDEX ERROR: name must not contain any characters apart from A-z, 0-9 and \'_\'.')
@@ -567,7 +600,7 @@ function TerrainEnumerator:addIndex(name, teIdxTemplate) -- errors because it's 
         error('TerrainEnumerator | INDEX ERROR: duplicate index name.')
     end
     self.idxTemplates[name] = teIdxTemplate
-    if self.isLevelLoaded and self.currentLevel ~= nil then
+    if self:isReady() then
         log('TerrainEnumerator | indexing ' .. name)
         local fileName = self.idxTemplates[name]:canCache() and self.cacheDist .. name .. '_' .. self.currentLevel or nil
         self.idxTrees[name] = TEIdxTree(self.idxTemplates[name], self.spawns, fileName)
@@ -591,7 +624,7 @@ function TerrainEnumerator:queryIndex(name, query) -- (query: function(TEIdxNode
         error('TerrainEnumerator | INDEX ERROR: no index with the name \'' .. name .. '\'.') -- development error
         return nil
     end
-    return self.idxTrees[name]:query(query)
+    return self.idxTrees[name]:queryTree(query)
 end
 
 function TerrainEnumerator:clearIdxCache(name)
@@ -609,6 +642,7 @@ function TerrainEnumerator:enumLevel(reEnum) -- enumerates current level
         return
     end
 
+    log('TerrainEnumerator | Evaluating valid spawn points.')
     self.currentLevel = level.name()
     self.spawns = {}
     self.idxTrees = {}
@@ -624,49 +658,33 @@ function TerrainEnumerator:enumLevel(reEnum) -- enumerates current level
     }
 
     -- enumeration (at least some freeze guaranteed)
-    local vCount = 0
     local vTotal = 0
 
-    local memGorging = {}
+    log('                  | Searching valid spawn points.')
+    local lvidTable = {}
     local iterX, iterZ = math.max(math.floor((bbMax.x - bbMin.x) / self.sample), 1), math.max(math.floor((bbMax.z - bbMin.z) / self.sample), 1)
     for _,y in ipairs(y_lvls) do
         for x=0,math.floor((bbMax.x - bbMin.x) / iterX) do
             for z=0,math.floor((bbMax.z - bbMin.z) / iterZ) do
                 vTotal = vTotal + 1
                 local pos = vector():set(bbMin.x  + (x * iterX), y, bbMin.z + (z * iterZ))
-
                 local lvid = level.vertex_id(pos)
-                if lvid > 0 then
+                if lvid > 0 and not lvidTable[lvid] then
                     pos = level.vertex_position(lvid) -- set to level vertex position
-
                     if math.abs(pos.x) + math.abs(pos.y) + math.abs(pos.z) > 0.1 then -- to high eps? well false negative <<< false positive
-                        local duplicate = false
-
-                        local function round(x)
-                            local floor = math.floor(x)
-                            if (x - floor) >= 0.5 then return floor
-                            else return math.ceil(x) end
-                        end
-                        local ofX = round(pos.x * 10) / 10
-                        local ofY = round(pos.y * 10) / 10
-                        local ofZ = round(pos.z * 10) / 10
-                        local ofStr = table.concat({ofX, ofY, ofZ}, '|')
-                        if memGorging[ofStr] then duplicate = true
-                        else memGorging[ofStr] = true end
-
-                        if not duplicate then
-                            vCount = vCount + 1 -- count valid
-                            table.insert(self.spawns, TESpawn(pos, lvid))
-                        end
+                        lvidTable[lvid] = true
                     end
                 end
             end
         end
     end
-    memGorging = nil -- free memory?
+    for lvid,flag in pairs(lvidTable) do -- checking the flag to future-proof
+        if flag then table.insert(self.spawns, TESpawn(lvid)) end
+    end
+    lvidTable = nil -- free memory?
 
     -- log stats & bild map
-    log('TerrainEnumerator | valid spawns: ' .. tostring(vCount) .. ' / ' .. tostring(vTotal))
+    log('                  | valid spawns: ' .. tostring(#self.spawns) .. ' / ' .. tostring(vTotal))
     self.map = TEChunkMap(self.spawns, iterX * 2, iterZ * 2)
 
     -- save in config
@@ -674,18 +692,16 @@ function TerrainEnumerator:enumLevel(reEnum) -- enumerates current level
 
     -- calculate indexes
     for name,_ in pairs(self.idxTemplates) do
-        log('TerrainEnumerator | indexing ' .. name)
+        log('                  | indexing ' .. name)
         local fileName = self.idxTemplates[name]:canCache() and self.cacheDist .. name .. '_' .. self.currentLevel or nil
         self.idxTrees[name] = TEIdxTree(self.idxTemplates[name], self.spawns, fileName)
     end
 end
 
 function TerrainEnumerator:_parsePointsCache(cache)
-    local sizeX, sizeZ
+    local sizeX, sizeZ = nil, nil
 
-    local pos = {}
     local lvid = nil
-
     local state = nil
     for read in cacheIterator(cache) do
         if not state then
@@ -693,16 +709,13 @@ function TerrainEnumerator:_parsePointsCache(cache)
             if bVal == 1 then -- new entry
                 state = nil
                 if lvid then -- create if previuos exists
-                    if #pos == 3 then
-                        table.insert(self.spawns, TESpawn(vector():set(pos[1], pos[2], pos[3]), lvid))
-                        pos = {}
-                        lvid = nil
-                    else -- format error
-                        log('TerrainEnumerator | LOAD ERROR: points file format error - malformed entry.')
-                        self.spawns = {}
-                        return nil
-                    end
+                    table.insert(self.spawns, TESpawn(lvid))
+                --[[else -- format error
+                    log('TerrainEnumerator | LOAD ERROR: points file format error - malformed entry.')
+                    self.spawns = {}
+                    return nil]]
                 end
+                lvid = nil
             elseif bVal == 2 then -- position number
                 state = 2
             elseif bVal == 3 then -- level vertex id
@@ -711,6 +724,8 @@ function TerrainEnumerator:_parsePointsCache(cache)
                 state = 4
             elseif bVal == 5 then -- chunk sizeZ
                 state = 5
+            elseif bVal == 6 then -- game vertex id
+                state = 6
             else -- format error
                 log('TerrainEnumerator | LOAD ERROR: points file format error - unkwnon symbol \\' .. bVal .. '.')
                 self.spawns = {}
@@ -719,14 +734,11 @@ function TerrainEnumerator:_parsePointsCache(cache)
         else
             if state == 2 then
                 state = nil
-                table.insert(pos, CParser.parse('f', read))
+                lvid = CParser.parse('i', read)
             elseif state == 3 then
                 state = nil
-                lvid = CParser.parse('i', read)
-            elseif state == 4 then
-                state = nil
                 sizeX = CParser.parse('i', read)
-            elseif state == 5 then
+            elseif state == 4 then
                 state = nil
                 sizeZ = CParser.parse('i', read)
             else
@@ -747,6 +759,7 @@ function TerrainEnumerator:loadLvlCfg(lvlName)
 
     local pointFile = io.open(self.pointFile .. lvlName, 'rb')
     if not pointFile then return false end
+    log('TerrainEnumerator | Loading point cache.')
 
     -- reading spawns
     local pCache = pointFile:read('*all')
@@ -756,6 +769,7 @@ function TerrainEnumerator:loadLvlCfg(lvlName)
     end
     pointFile:close()
     local csX, csZ = self:_parsePointsCache(pCache)
+    log('                  | Loaded ' .. tostring(#self.spawns) .. ' spawn points.')
     if csX == nil or csZ == nil then
         return false
     end
@@ -789,27 +803,17 @@ function TerrainEnumerator:saveLvlCfg()
     -- wrire points
     local fw = fileWriter(pointFile)
 
-    log('   -- sizeX')
-    fw.write(4, true) -- chunk sizeX
+    fw.write(3, true) -- chunk sizeX
     fw.write(self.map.sizeX)
 
-    log('   -- sizeZ')
-    fw.write(5, true) -- chunk sizeZ
+    fw.write(4, true) -- chunk sizeZ
     fw.write(self.map.sizeZ)
 
     for i=1,#self.spawns do
-        log('   -- point')
         local sp = self.spawns[i]
         fw.write(1, true) -- new entry
 
-        fw.write(2, true) -- position x
-        fw.write(sp.pos.x)
-        fw.write(2, true) -- position y
-        fw.write(sp.pos.y)
-        fw.write(2, true) -- position z
-        fw.write(sp.pos.z)
-
-        fw.write(3, true) -- level vertex id
+        fw.write(2, true) -- level vertex id
         fw.write(sp.lvid)
     end
 
@@ -843,14 +847,55 @@ function TerrainEnumerator:debugShowParticles()
 end
 
 -- Callbacks
+function TerrainEnumerator:addOnReadyCC(name, cc)
+    if string.find(name, '[^%a%d_]') ~= nil then
+        error('TerrainEnumerator | CC ERROR: name must not contain any characters apart from A-z, 0-9 and \'_\'.')
+    end
+    if self.callbacks.onReady[name] ~= nil then
+        error('TerrainEnumerator | CC ERROR: duplicate callback name.')
+    end
+    self.callbacks.onReady[name] = cc
+end
+function TerrainEnumerator:removeOnReadyCC(name)
+    if self.callbacks.onReady[name] == nil then
+        log('TerrainEnumerator | CC ERROR: no calback with the name \'' .. name .. '\'.')
+        return false
+    end
+    self.callbacks.onReady[name] = nil
+end
+
+function TerrainEnumerator:addOnLvlChangeCC(name, cc)
+    if string.find(name, '[^%a%d_]') ~= nil then
+        error('TerrainEnumerator | CC ERROR: name must not contain any characters apart from A-z, 0-9 and \'_\'.')
+    end
+    if self.callbacks.onLvlChange[name] ~= nil then
+        error('TerrainEnumerator | CC ERROR: duplicate callback name.')
+    end
+    self.callbacks.onLvlChange[name] = cc
+end
+function TerrainEnumerator:removeOnLvlChangeCC(name)
+    if self.callbacks.onLvlChange[name] == nil then
+        log('TerrainEnumerator | CC ERROR: no calback with the name \'' .. name .. '\'.')
+        return false
+    end
+    self.callbacks.onLvlChange[name] = nil
+end
+
 function TerrainEnumerator:CC_OnLevelLoaded() -- terain and stuff
-    self.isLevelLoaded = true
+    _actor = alife():actor()
     self:enumLevel()
+    self.isLevelLoaded = true
+    CreateTimeEvent('TerrainEnumerator_OnReady', 'TerrainEnumerator_OnReady', 0.01, function()
+        for _,cc in pairs(self.callbacks.onReady) do if cc then cc() end end
+        return true
+    end)
 end
 
 function TerrainEnumerator:CC_OnBeforeLevelChanging()
+    _actor = nil
     self.debugRender = false
     self.isLevelLoaded = false
+    for _,cc in pairs(self.callbacks.onLvlChange) do cc() end
 end
 
 function TerrainEnumerator:CC_OnKeyPress(key)
@@ -865,6 +910,7 @@ function TerrainEnumerator:CC_OnKeyPress(key)
 end
 
 _G.TerEnum = TerrainEnumerator()
+function Require() return true end
 --[[TerEnum:addIndex('random', TEIdxTemplate(
     function(sp)   -- evalLeaf     (sp: TESpawn) -> <index_value> | evaluete index value of the leaf
         return math.random()

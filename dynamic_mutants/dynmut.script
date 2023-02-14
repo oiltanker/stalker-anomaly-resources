@@ -1,0 +1,590 @@
+--[[
+
+Dynamic mob functions
+ - dynmut.UnbindMob(id: number)                                                      - unbind dynamic mutant from pipeline
+ - dynmut.RemoveMob(id: number)                                                      - same, but also removes mutant from the game
+ - dynmut.AddToMobPipeline(id: number)                                               - add created mutant to the pipeline, works with server objects
+ - dynmut.AddOnMobRegCC(id: number, cc: function(mobSt: <mob_entry_storage>) -> nil) - add callback to be called, when pipeline finishes registering mob entry
+ - dynmut.AddMobLogic(id: number, params: <logic_params>)                            - add logic handler to a mob, configured by logic parameters, described below
+
+Logic parameters:
+logicParams = {
+    home          = <number>  -- level vertex id to serve as center of mob's home
+    homeRadius    = <number>  -- radius from home vertex where mob can wander
+    aggroRange    = <number>  -- (default: 75) radius in which mob will aggro on target,  `0` meaning no visual detection (i.e. blind / non-tactile)
+    los           = <boolean> -- (default: true) specifies if mob needs visual contact to aggro, used for aggroRange
+    hearRange     = <number>  -- (default: aggroRange * 2) radius from where mob builds sound profiles for sound aggro,  `0` meaning no sound detection (i.e. deaf)
+    nonAggressive = <boolean> -- (default: false) turns mob completely non-aggressive
+}
+
+]]
+
+
+terrain_enumerator.Require()
+schemes.dynmut = 'dynmut'
+
+
+local function assertId(id)
+    if not id or not (0 < id and id < 65535) then error('DynMut | Invalid mob id.', 2) end
+end
+
+
+
+
+-- ANOMALIES
+
+
+_G.level_anomaly_list = {}
+
+local function getSeObjLvl(se_obj)
+    local target_level_id = game_graph():vertex(se_obj.m_game_vertex_id):level_id()
+    local target_level_name = alife():level_name(target_level_id)
+
+    return target_level_name
+end
+local function initAnomalies()
+    -- iterate server objects
+    for i=0,65534 do
+        local se_obj = alife_object(i)
+        if se_obj and IsAnomaly(se_obj) then -- anomalies
+            local lvlName = getSeObjLvl(se_obj)
+            if level_anomaly_list[lvlName] == nil then level_anomaly_list[lvlName] = { se_obj }
+            else table.insert(level_anomaly_list[lvlName], se_obj) end
+        end
+    end
+end
+
+
+
+
+-- MOB PIPELINE
+
+
+Mobs = {}
+
+
+local function _unbindMob(id, mobSt)
+    if mobSt.action then mobSt.action:__destroy() end
+
+    local store = mobSt.store()
+    if store then
+        store.active_scheme = nil
+        store.active_section = nil
+    end
+
+    Mobs[id] = nil
+end
+
+function UnbindMob(id)
+    assertId(id)
+
+    local mobSt = Mobs[id]
+    if not mobSt then error('DynMut | No such mob was registered.') end
+    _unbindMob(id, mobSt)
+end
+
+function RemoveMob(id)
+    assertId(id)
+
+    local mobSt = Mobs[id]
+    if not mobSt then error('DynMut | No such mob was registered.') end
+
+    _unbindMob(id, mobSt)
+    local se_obj = alife_object(id)
+    if se_obj then alife():release(se_obj) end
+end
+
+
+local _regCC = {}
+local regCCs = {}
+function AddOnMobRegCC(id, cc)
+    assertId(id)
+
+    if regCCs[id] == nil then regCCs[id] = { cc }
+    else table.insert(regCCs[id], cc) end
+end
+local function monster_on_net_spawn(obj)
+    local id = obj:id()
+
+    local mobSt = Mobs[obj:id()]
+    if not mobSt then return end
+
+    if _regCC[id] ~= nil then
+        _regCC[id]()
+        _regCC[id] = nil
+    end
+end
+local function monster_on_net_destroy(obj)
+    local id = obj:id()
+
+    local mobSt = Mobs[id]
+    if not mobSt then return end
+
+    _regCC[id] = nil
+    regCCs[id] = nil
+    --if mobSt.action then mobSt.action:__destroy() end
+    --Mobs[id] = nil
+    _unbindMob(id, mobSt)
+end
+
+function AddToMobPipeline(id)
+    assertId(id)
+
+    local mob = alife_object(id)
+    if not mob then error('DynMut | Mob with id ' .. tostring(id) .. ' does not exists') end
+
+    Mobs[id] = {
+        srv = mob,
+        sim = nil,
+        store = function() return db.storage[id] end,
+        action = nil,
+        reg = false
+    }
+
+    local simName = 'dynmut_sim_' .. id
+
+    local register = function()
+        local simMob = level and level.object_by_id(id)
+        if simMob == nil then return false end
+
+        Mobs[id].sim = simMob
+        Mobs[id].reg = true
+
+        if regCCs[id] ~= nil then
+            for _,cc in ipairs(regCCs[id]) do cc(Mobs[id]) end
+            regCCs[id] = nil
+        end
+        return true
+    end
+
+    local simulate = function()
+        local doRegister = false
+        if mob.online then
+            doRegister = true
+        elseif mob:can_switch_online() then
+            doRegister = true
+            mob:switch_online()
+        end
+
+        if doRegister then
+            if not register() then _regCC[id] = register end
+            return true
+        else
+            ResetTimeEvent(simName, simName, 0.1)
+            return false
+        end
+    end
+
+    utils_obj.switch_online(id)
+    CreateTimeEvent(simName, simName, 0, simulate)
+end
+
+
+
+
+-- MOB LOGIC
+
+
+-- MobLogic class
+class 'MobLogic'
+function MobLogic:__init(mobSt)
+    self.object = mobSt.sim
+    self.st = mobSt:store()
+    self.logic = mobSt.logic and mobSt.logic or {}
+    self.last_update = nil
+    self.memory = {
+        sound = {},
+        vision = { who = nil, where = nil, when = nil },
+        ivestigate = {},
+        lastUpdate = nil
+    }
+end
+
+function MobLogic:__tostring() return 'MobLogic' end
+
+function MobLogic:__destroy()
+    self.object = nil
+    self.st = nil
+    self.logic = nil
+    self.last_update = nil
+end
+
+function MobLogic:_timeElapsed()
+    local time = time_global()
+
+    if self.last_update == nil then
+        return math.huge
+    else
+        return (time - self.last_update) / 1000
+    end
+end
+
+function MobLogic:_timeSet()
+    local time = time_global()
+    self.last_update = time
+end
+
+function MobLogic:_inAnomalyRadius(amomale, pos) -- amomale is anomaly server object
+    local aPos = amomale.position
+    local aData = utils_stpk.get_anom_zone_data(amomale)
+    local aRadius = aData and aData.shapes and aData.shapes[1] and aData.shapes[1].radius
+    if not (pos and aPos and aRadius) then return false end
+
+    if pos:distance_to(aPos) < aRadius then return true -- in the radius
+    else return false end
+end
+
+function MobLogic:isSafePosition(pos) -- pos: new mob position
+    local result = true
+
+    -- iterate anomnalies
+    local lvlName = TerEnum.currentLevel
+    local lvlAnomalies = level_anomaly_list and level_anomaly_list[lvlName] or nil
+    if lvlAnomalies and #lvlAnomalies > 0 then
+        for _,a in ipairs(lvlAnomalies) do
+            if self:_inAnomalyRadius(a, pos) then
+                result = false
+                break
+            end
+        end
+    end
+
+    return result
+end
+
+function MobLogic:update(delta) -- TODO: fix mobs being stuck on terrain?
+    local enemy = self.object:get_enemy()
+    if not self.object or enemy then
+        self.memory.vision.who = enemy:id()
+        self.memory.vision.where = enemy:position()
+        return
+    end
+    log(' -- MobLogic:update [' .. self.object:id() .. ']')
+
+    if not xr_logic.mob_captured(self.object) then -- re-capture if no threats
+        xr_logic.mob_capture(self.object, true)
+    end
+
+    local curiosity = -math.huge
+    local investigate = nil
+    for id,pos in pairs(self.memory.ivestigate) do
+        if self.memory.sound[id] > curiosity then
+            curiosity = self.memory.sound[id]
+            investigate = pos
+        end
+    end
+
+    local moveRoll = math.random(1, 2)
+    if self.memory.vision.who ~= nil then
+        xr_logic.mob_capture(self.object, true)
+        action(self.object, move(move.run_fwd, self.memory.vision.where), cond(cond.move_end))
+    elseif investigate then
+        local radius = self.logic.homeRadius
+        local pos = level.vertex_position(self.logic.home)
+
+        local rPos = vector():set(investigate.x - pos.x, investigate.y - pos.y, investigate.z - pos.z)
+        rPos = rPos:normalize():mul(math.min(radius, math.sqrt(rPos.x^2 + rPos.y^2 + rPos.z^2)))
+        local sp = TerEnum:getClosest(vector():set(rPos.x + pos.x, rPos.y + pos.y, rPos.z + pos.z))
+        local dist = sp and self.object:position():distance_to(sp.pos) or math.huge
+
+        if dist > 1 then moveRoll = 2
+        elseif dist < radius * 1.5 then
+            xr_logic.mob_capture(self.object, true)
+            local m = dist < 10 and move.walk_fwd or move.run_fwd
+            action(self.object, move(m, sp.pos), cond(cond.move_end))
+        end
+    elseif self.logic and self.logic.home then
+        local curAct = self.object:action()
+        if curAct == nil or curAct:completed() or self:_timeElapsed() >= 5 then
+            if moveRoll == 1 then -- move
+                xr_logic.mob_capture(self.object, true)
+                local pos = level.vertex_position(self.logic.home)
+
+                local radius = self.logic.homeRadius
+
+                local sp, dist, tries = nil, math.huge, 3
+                while (sp == nil or dist > radius) and tries > 0 do
+                    local rVec = vector():set(
+                        math.random() * 2 - 1,
+                        0,
+                        math.random() * 2 - 1
+                    ):normalize():mul(math.random() * radius) -- possible runaway when close to [0,0,0] vector, consider using `normalize_safe` instead
+
+                    sp = TerEnum:getClosest(vector():set(pos.x + rVec.x, pos.y, pos.z + rVec.z))
+                    dist = sp and self.object:position():distance_to(sp.pos) or math.huge
+                    tries = tries - 1
+                end
+
+                if sp and dist < radius and self.object:accessible(sp.lvid) and self.object:accessible(sp.pos) and self:isSafePosition(sp.pos) then
+                    local m = dist < 10 and move.walk_fwd or move.run_fwd
+                    action(self.object, move(m, sp.pos), cond(cond.move_end))
+                    self:_timeSet()
+                end
+            elseif moveRoll == 2 then -- chill
+                xr_logic.mob_capture(self.object, true)
+
+                local vec = vector():set(math.random() * 2 - 1, math.random() * 2 - 1, math.random() * 2 - 1):normalize()
+                action(self.object, look(look.direction, vec),  cond(cond.time_end, 5000))
+                self:_timeSet()
+            end
+        end
+    end
+end
+
+function MobLogic:forgetAggro() -- forget stuff
+    if not self.memory.lastUpdate then self.memory.lastUpdate = time_global() end
+    local elapsed = (time_global() - self.memory.lastUpdate) / 1000
+    self.memory.lastUpdate = time_global()
+
+    local forgetAmount = MobLogic.SoundForgetPerSecond * elapsed
+    for id,val in pairs(self.memory.sound) do
+        val = val <= MobLogic.SoundCap and val - forgetAmount or MobLogic.SoundCap
+        if val > 0 then
+            self.memory.sound[id] = val
+            if val < MobLogic.SoundCap/2 then self.memory.ivestigate[id] = nil end
+        else
+            self.memory.sound[id] = nil
+            self.memory.ivestigate[id] = nil
+        end
+    end
+
+    if self.memory.vision.who ~= nil and (time_global() - self.memory.vision.when) > (1000 * 10) then
+        self.memory.vision = { who = nil, where = nil, when = nil }
+    end
+end
+
+function MobLogic:evalEnemy(enemy) -- aggro
+    if not self.object or not enemy then return end
+    if self.object:relation(enemy) < game_object.enemy then return false end
+
+    local distToEnemy = self.object:position():distance_to(enemy:position())
+
+    if not self.logic.nonAggressive then
+        -- cooldown
+        if self.memory.vision.who == enemy:id() and (time_global() - self.memory.vision.when) < (1000 * 10) then
+            self.memory.vision.where = enemy:position()
+            self:forgetAggro()
+            return true
+        end
+        -- seeing stuff
+        if self.logic.aggroRange > 0 and distToEnemy <= self.logic.aggroRange then
+            if self.logic.los then
+                if self.object:see(enemy) then
+                    if self.memory.vision.who == nil or self.memory.vision.who == enemy:id() then
+                        self.memory.vision.who = enemy:id()
+                        self.memory.vision.where = enemy:position()
+                        self.memory.vision.when = time_global()
+                    end
+                    return true
+                end
+            else
+                if self.memory.vision.who == nil or self.memory.vision.who == enemy:id() then
+                    self.memory.vision.who = enemy:id()
+                    self.memory.vision.where = enemy:position()
+                    self.memory.vision.when = time_global()
+                end
+                return true
+            end
+        end
+        -- hearing stuff
+        if self.memory.sound[enemy:id()] ~= nil and self.memory.sound[enemy:id()] >= MobLogic.SoundCap then
+            if self.memory.vision.who == nil or self.memory.vision.who == enemy:id() then
+                self.memory.vision.who = enemy:id()
+                self.memory.vision.where = enemy:position()
+                self.memory.vision.when = time_global()
+            end
+            self:forgetAggro()
+            return true
+        else self:forgetAggro() end
+    end
+
+    return false
+end
+
+MobLogic.AggrSndMap = {
+    WPN_shoot  = 1,
+    WPN_empty  = 1/4,
+    WPN_hit    = 1,
+    WPN_reload = 1/2,
+
+    ITM_drop   = 1/2,
+    ITM_use    = 1/8,
+
+    MST_damage = 1/2,
+    MST_step   = 1/2,
+    MST_talk   = 1/4,
+    MST_attack = 1/2,
+    MST_eat    = 1/8,
+}
+MobLogic.SoundCap = 3
+MobLogic.SoundForgetPerSecond = MobLogic.SoundCap / 5
+function MobLogic:evalHear(whoId, sType, sDist, sPow, sPos)
+    sDist = self.object:position():distance_to(sPos) -- overwrite, due to square
+
+    local enemy = whoId and level.object_by_id(whoId) or nil
+    if
+        not enemy or
+        not MobLogic.AggrSndMap[sType] or
+        self.logic.hearRange <= 0 or
+        sDist > self.logic.hearRange or
+        self.object:relation(enemy) < game_object.enemy
+    then return end
+
+    local sDiv = sDist / 50 * 2
+    sDiv = sDiv > 1 and sDiv or 1
+    self.memory.sound[whoId] = (self.memory.sound[whoId] or 0) + (sPow / sDiv * MobLogic.AggrSndMap[sType])
+
+    local isActorSound = db.actor:id() == whoId
+
+    if self.memory.sound[whoId] >= MobLogic.SoundCap and self.memory.vision.who == nil then
+        self.memory.vision.who = whoId
+        self.memory.vision.where = sPos
+        self.memory.vision.when = time_global()
+    elseif self.memory.sound[whoId] >= MobLogic.SoundCap/2 then
+        self.memory.ivestigate[whoId] = sPos
+    end
+end
+
+-- logic functions
+local function on_enemy_eval(obj, enemy, flags)
+    local mobSt = Mobs[obj:id()]
+    if not mobSt then return end
+
+    if mobSt.logic and mobSt.action:evalEnemy(enemy) then
+        return
+    end
+
+    flags.override = true
+    flags.result = false
+end
+
+local function npc_on_hear_callback(obj, who_id, s_type, sound_dist, sound_power, sound_position)
+    local mobSt = Mobs[obj:id()]
+    if not mobSt then return end
+
+    if true and mobSt.logic then
+        mobSt.action:evalHear(who_id, s_type, sound_dist, sound_power, sound_position)
+    end
+end
+
+
+
+
+-- LOGIC PIPELINE
+
+
+function TimedAddMobLogic(id, mobSt)
+    -- setup logic handler
+    local action = MobLogic(mobSt)
+    mobSt.action = action
+
+    local store = mobSt.store()
+    if store.dynmut == nil then store.dynmut = {} end
+    xr_logic.subscribe_action_for_events(mobSt.sim, store.dynmut, action)
+
+    CreateTimeEvent('mob_logic_' .. id, 'mob_logic_' .. id, 0, function()
+        store.dynmut.state = ''
+        store.dynmut.no_reset = false
+
+        store.active_scheme = 'dynmut'
+        store.active_section = 'dynmut'
+        xr_logic.mob_capture(mobSt.sim, true)
+        return true
+    end)
+end
+
+function AddMobLogic(id, params)
+    assertId(id)
+    params = params and params or {}
+
+    local mobSt = Mobs[id]
+    if not mobSt then error('DynMut | No such mob was registered (first needs to be added to mob pipeline, use `dynmut.AddToMobPipeline`).') end
+
+    mobSt.logic = {}
+    -- home
+    mobSt.logic.home = params.home and params.home or nil
+    mobSt.logic.homeRadius = params.homeRadius and params.homeRadius or 25
+    -- vision
+    mobSt.logic.aggroRange = params.aggroRange >= 0 and params.aggroRange or 75
+    mobSt.logic.los = params.los ~= nil and (params.los and true or false) or true -- line of sight
+    -- sound
+    mobSt.logic.hearRange = params.hearRange >= 0 and params.hearRange or mobSt.logic.aggroRange * 2
+    -- aggression
+    mobSt.logic.nonAggressive = params.nonAggressive and true or false
+
+
+    if mobSt.reg then TimedAddMobLogic(id, mobSt)
+    else AddOnMobRegCC(id, function(_) TimedAddMobLogic(id, mobSt) end) end
+end
+
+
+
+
+-- SAVING AND LOADING
+
+
+AddScriptCallback('dynmut_on_save')
+AddScriptCallback('dynmut_on_load')
+
+local mBinderSave = bind_monster.generic_object_binder.save_state
+function bind_monster.generic_object_binder:save_state(m_data)
+    local mobSt = Mobs[self.object:id()]
+    if not mobSt then return mBinderSave(self, m_data) end
+
+    local store = mobSt.store()
+    store.active_scheme = nil
+    store.active_section = nil
+
+    local res = mBinderSave(self, m_data)
+
+    local state = alife_storage_manager.get_game_object_state(self.object,true)
+    if not state then return res end
+
+    state.dynmut = empty_table(state.dynmut) -- empty if was saved before
+    state.dynmut.logic = mobSt.logic
+
+    SendScriptCallback('dynmut_on_save', mobSt, state.dynmut)
+    return res
+end
+
+local mBinderLoad = bind_monster.generic_object_binder.load_state
+function bind_monster.generic_object_binder:load_state()
+    local res = mBinderLoad(self)
+
+    local state = alife_storage_manager.get_game_object_state(self.object)
+    if not state or not state.dynmut then return res end
+
+    local id = self.object:id()
+    Mobs[id] = {
+        srv = alife_object(id),
+        sim = self.object,
+        store = function() return db.storage[id] end,
+        action = nil,
+        reg = true
+    }
+
+    if state.dynmut.logic then
+        Mobs[id].logic = state.dynmut.logic
+        TimedAddMobLogic(id, Mobs[id])
+    end
+
+    SendScriptCallback('dynmut_on_load', Mobs[id], state.dynmut)
+    return res
+end
+
+
+
+
+-- ON GAME START
+
+
+TerEnum:addOnReadyCC('DynMut_OnReady', function()
+    if next(level_anomaly_list) == nil then initAnomalies() end
+end)
+
+function on_game_start()
+    RegisterScriptCallback('monster_on_net_destroy', monster_on_net_destroy)
+    RegisterScriptCallback('monster_on_net_spawn', monster_on_net_spawn)
+    RegisterScriptCallback('npc_on_hear_callback', npc_on_hear_callback)
+    RegisterScriptCallback('on_enemy_eval', on_enemy_eval)
+end
