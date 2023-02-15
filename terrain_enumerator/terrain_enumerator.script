@@ -262,6 +262,7 @@ function TEIdxTree:__init(teIdxTemplate, leaves, filePath)
     self.teIdxTemplate = teIdxTemplate
     self.leaves = leaves
     self.filePath = filePath
+    self._min, self._max = nil, nil
 
     self.root = nil
     if not self.filePath then
@@ -273,6 +274,7 @@ function TEIdxTree:__init(teIdxTemplate, leaves, filePath)
 end
 
 function TEIdxTree:buildTree()
+    error()
     -- assign index values to leaf nodes
     local leafIndexValues = {}
     for i = 1, #self.leaves do
@@ -283,6 +285,7 @@ function TEIdxTree:buildTree()
     end
     table.sort(leafIndexValues, function(a, b) return self.teIdxTemplate.decideValue(a.val, b.val) end)
     if #self.leaves ~= #leafIndexValues then error('lua sort fail again') end
+    self._min, self._max = leafIndexValues[1].val, leafIndexValues[#leafIndexValues].val
 
     -- build tree using a queue
     local queue = { { l = 1, r = #leafIndexValues, cc = function(n) self.root = n end } }
@@ -303,6 +306,10 @@ function TEIdxTree:buildTree()
         local elem = table.remove(queue, 1)
         loop(elem.l, elem.r, elem.cc)
     end
+end
+
+function TEIdxTree:getBounds()
+    return self._min, self._max
 end
 
 function TEIdxTree:queryTree(query) -- (query: function(TEIdxNode) -> TEDecision) -> leaves[] | collect all leaves that fit the query
@@ -336,6 +343,12 @@ function TEIdxTree:write(filePath)
     end
 
     local fw = fileWriter(file)
+
+    fw.write(7, true) -- valMin
+    fw.write(self.teIdxTemplate.packValue(self._min))
+
+    fw.write(8, true) -- valMax
+    fw.write(self.teIdxTemplate.packValue(self._max))
 
     local getIdx = newCounter(1, nil, 1)
     local queue = { { node = self.root, idx = getIdx() } }
@@ -407,10 +420,12 @@ function TEIdxTree:load(filePath)
                 if idx then
                     if value and (leafId or (leftIdx and rightIdx)) then
                         if leafId then -- leaf node
-                            nodeTable[idx] = TEIdxNode(self.teIdxTemplate.unpackValue(value), nil, nil)
+                            local lVal = self.teIdxTemplate.unpackValue(value)
+                            nodeTable[idx] = TEIdxNode(lVal, nil, nil)
                             nodeTable[idx].leafId = leafId
                         else -- tree node
-                            nodeTable[idx] = TEIdxNode(self.teIdxTemplate.unpackValue(value), leftIdx, rightIdx)
+                            local lVal = self.teIdxTemplate.unpackValue(value)
+                            nodeTable[idx] = TEIdxNode(lVal, leftIdx, rightIdx)
                         end
                     else
                         log('TEIdxTree | LOAD ERROR: index file format error - malformed entry.')
@@ -422,16 +437,8 @@ function TEIdxTree:load(filePath)
                 leafId = nil
                 leftIdx = nil
                 rightIdx = nil
-            elseif bVal == 2 then -- idx
-                state = 2
-            elseif bVal == 3 then -- value
-                state = 3
-            elseif bVal == 4 then -- leafId
-                state = 4
-            elseif bVal == 5 then -- leftIdx
-                state = 5
-            elseif bVal == 6 then -- rightIdx
-                state = 6
+            else -- 2 - idx, 3 - value, 4 - leafId, 5 - leftIdx, 6 - rightIdx, 7 - valMin, 8 - valMax
+                state = bVal
             end
         else
             if state == 2 then
@@ -449,6 +456,12 @@ function TEIdxTree:load(filePath)
             elseif state == 6 then
                 state = nil
                 rightIdx = CParser.parse('i', read)
+            elseif state == 7 then
+                state = nil
+                self._min = self.teIdxTemplate.unpackValue(CParser.parse('s', read))
+            elseif state == 8 then
+                state = nil
+                self._max = self.teIdxTemplate.unpackValue(CParser.parse('s', read))
             else
                 log('TEIdxTree | LOAD ERROR: index file format error - malformed file.')
                 return false
@@ -625,6 +638,14 @@ function TerrainEnumerator:queryIndex(name, query) -- (query: function(TEIdxNode
         return nil
     end
     return self.idxTrees[name]:queryTree(query)
+end
+
+function TerrainEnumerator:idexBounds(name)
+    if self.idxTemplates[name] == nil then
+        error('TerrainEnumerator | INDEX ERROR: no index with the name \'' .. name .. '\'.') -- development error
+        return nil
+    end
+    return self.idxTrees[name]:getBounds()
 end
 
 function TerrainEnumerator:clearIdxCache(name)
