@@ -274,7 +274,6 @@ function TEIdxTree:__init(teIdxTemplate, leaves, filePath)
 end
 
 function TEIdxTree:buildTree()
-    error()
     -- assign index values to leaf nodes
     local leafIndexValues = {}
     for i = 1, #self.leaves do
@@ -547,7 +546,7 @@ function TEChunkMap:closest(pos) -- (pos: vector) -> TESpawn | returns closest p
             for iZ in seq(-i+1, i) do table.insert(chunks, self.chunks[x+i] and self.chunks[x+i][z+iZ]) end
             for iX in seq(i-1, -i) do table.insert(chunks, self.chunks[x+iX] and self.chunks[x+iX][z+i]) end
             for iZ in seq(i-1, -i+1) do table.insert(chunks, self.chunks[x-i] and self.chunks[x-i][z+iZ]) end
-        else chunks = { self.chunks[x][z] } end
+        else chunks = {  self.chunks[x] and self.chunks[x][z] } end
 
         local dist = math.huge
         local closest = nil

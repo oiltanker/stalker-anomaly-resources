@@ -15,6 +15,7 @@ logicParams = {
     los           = <boolean> -- (default: true) specifies if mob needs visual contact to aggro, used for aggroRange
     hearRange     = <number>  -- (default: aggroRange * 2) radius from where mob builds sound profiles for sound aggro,  `0` meaning no sound detection (i.e. deaf)
     nonAggressive = <boolean> -- (default: false) turns mob completely non-aggressive
+    ambushRange   = <number>  -- (default: 0) turn mob into ambush mob, that will trigger ONLY when enemy gets within provided range or line of sight
 }
 
 Callbacks:
@@ -189,6 +190,13 @@ end
 -- MOB LOGIC
 
 
+local MobLastAction = {
+    look = 1,
+    move = 2,
+    investigate = 3,
+    pursuit = 4,
+}
+
 -- MobLogic class
 class 'MobLogic'
 function MobLogic:__init(mobSt)
@@ -199,9 +207,10 @@ function MobLogic:__init(mobSt)
     self.memory = {
         sound = {},
         vision = { who = nil, where = nil, when = nil },
-        ivestigate = {},
+        investigation = { who = nil, where = nil, when = nil, value = nil },
         lastUpdate = nil
     }
+    self.lastAction = nil
 end
 
 function MobLogic:__tostring() return 'MobLogic' end
@@ -256,156 +265,241 @@ function MobLogic:isSafePosition(pos) -- pos: new mob position
     return result
 end
 
-function MobLogic:update(delta) -- TODO: fix mobs being stuck on terrain?
-    local enemy = self.object:get_enemy()
-    if not self.object or enemy then
-        self.memory.vision.who = enemy:id()
-        self.memory.vision.where = enemy:position()
-        return
+function MobLogic:checkAction(act, pursuitTarget, investigationTarget)
+    local dist = ( -- for move actions
+        act ~= MobLastAction.move or
+        act ~= MobLastAction.investigate or
+        act ~= MobLastAction.pursuit
+    ) and self.object:position():distance_to(act.param) or nil
+    if dist then -- some move action
+        if dist >= 1 then -- not yet arrived to the target
+            if pursuitTarget and (act ~= MobLastAction.pursuit) then return false -- switch to pursuit
+            elseif investigationTarget and (act ~= MobLastAction.investigate) then return false end -- switch to investigation
+            return true
+        else return false end
+    elseif act == MobLastAction.look then -- look action
+        if pursuitTarget or investigationTarget then -- new priority
+            dist = self.object:position():distance_to(pursuitTarget or investigationTarget)
+            return dist < 1 -- keep looking if already at the target
+        else return true end
     end
-    log(' -- MobLogic:update [' .. self.object:id() .. ']')
+    error('MobLogic | Unimplemented action logic.')
+end
+
+local p1, p2 = nil, nil
+function MobLogic:update(delta) -- TODO: fix mobs being stuck on terrain?
+    --local enemy = self.object:get_enemy()
+    if not self.object then return end
 
     if not xr_logic.mob_captured(self.object) then -- re-capture if no threats
         xr_logic.mob_capture(self.object, true)
     end
 
-    local curiosity = -math.huge
-    local investigate = nil
-    for id,pos in pairs(self.memory.ivestigate) do
-        if self.memory.sound[id] > curiosity then
-            curiosity = self.memory.sound[id]
-            investigate = pos
+    for id,snd in pairs(self.memory.sound) do -- update/find investigation direction if any
+        if
+            self.memory.investigation.who == id or -- update for existing investigation (e.g. last heard sound)
+            snd.val > MobLogic.SoundCap / 2 and (not self.memory.investigation.value or snd.val > self.memory.investigation.value) -- new/louder sound profile
+        then
+            self.memory.investigation = {
+                who = id,
+                where = vector():set(snd.pos),
+                when = time_global(),
+                value = math.max(snd.val, self.memory.investigation.who == id and self.memory.investigation.value or 0) -- preserve value for existing investigation
+            }
         end
     end
+    local investigate = self.memory.investigation.where and vector():set(self.memory.investigation.where) or nil
 
-    local moveRoll = math.random(1, 2)
-    if self.memory.vision.who ~= nil then
+    -- action decision
+    local curAct = self.object:action()
+    if curAct == nil or curAct:completed() or self:_timeElapsed() >= 5 or not self:checkAction(self.lastAction, self.memory.vision.where, investigate) then -- reset/prepare for new action
+        self.lastAction = nil
         xr_logic.mob_capture(self.object, true)
-        action(self.object, move(move.run_fwd, self.memory.vision.where), cond(cond.move_end))
-    elseif investigate then
-        local radius = self.logic.homeRadius
-        local pos = level.vertex_position(self.logic.home)
+    else
+        return
+    end -- action still in the process
 
-        local rPos = vector():set(investigate.x - pos.x, investigate.y - pos.y, investigate.z - pos.z)
-        rPos = rPos:normalize():mul(math.min(radius, math.sqrt(rPos.x^2 + rPos.y^2 + rPos.z^2)))
-        local sp = TerEnum:getClosest(vector():set(rPos.x + pos.x, rPos.y + pos.y, rPos.z + pos.z))
-        local dist = sp and self.object:position():distance_to(sp.pos) or math.huge
-
-        if dist > 1 then moveRoll = 2
-        elseif dist < radius * 1.5 then
-            xr_logic.mob_capture(self.object, true)
-            local m = dist < 10 and move.walk_fwd or move.run_fwd
-            action(self.object, move(m, sp.pos), cond(cond.move_end))
-        end
+    -- new action switch
+    local moveRoll = math.random(1, 2) -- for home logic purposes
+    if self.memory.vision.who ~= nil then -- lost vision and aggro? => go to the last seen position
+        if self.object:position():distance_to(self.memory.vision.where) >= 2 then -- not close enough to the last aggro position
+            action(self.object, move(move.run_fwd, self.memory.vision.where), cond(cond.move_end))
+            self.lastAction = { type = MobLastAction.pursuit, param = self.memory.vision.where }
+        else moveRoll = 2 end -- just sit around, maybe will find enemy again
     elseif self.logic and self.logic.home then
-        local curAct = self.object:action()
-        if curAct == nil or curAct:completed() or self:_timeElapsed() >= 5 then
-            if moveRoll == 1 then -- move
-                xr_logic.mob_capture(self.object, true)
-                local pos = level.vertex_position(self.logic.home)
+        if investigate ~= nil then -- Investigating closest home position to the sound source
+            -- home limitations
+            local radius = self.logic.homeRadius
+            local pos = level.vertex_position(self.logic.home)
 
+            -- position closest to the sound inside home radius
+            local rPos = vector():set(investigate):sub(pos)
+            local rMag = rPos:magnitude()
+            rPos = rPos:normalize():mul(math.min(radius, rMag)):add(pos)
+            -- translate to the valid standing position
+            local lvid = level.vertex_id(rPos)
+            local sp = lvid > 0 and level.vertex_position(lvid) or nil
+            if sp and math.abs(sp.x) + math.abs(sp.y) + math.abs(sp.z) <= 0.1 then sp = nil end
+
+            -- got to the position if found, or just sit around
+            local dist = sp and self.object:position():distance_to(sp) or math.huge
+            if sp and pos:distance_to(sp) < radius * 1.5 and dist >= 1 and self:isSafePosition(sp) then
+                local m = dist < 10 and move.walk_fwd or move.run_fwd
+                action(self.object, move(m, sp), cond(cond.move_end))
+                self.lastAction = { type = MobLastAction.investigate, param = sp }
+            else moveRoll = 2 end
+        else -- Walking or sitting around inside home area
+            if moveRoll == 1 then -- move
+                -- home limitations
+                local pos = level.vertex_position(self.logic.home)
                 local radius = self.logic.homeRadius
 
-                local sp, dist, tries = nil, math.huge, 3
-                while (sp == nil or dist > radius) and tries > 0 do
+                -- looping to find valid new home position
+                local sp, dist, tries, homeDist = nil, 0, 3, math.huge
+                while (sp == nil or dist < 2 or homeDist > radius) and tries > 0 do
+                    -- random vector relative to home position
                     local rVec = vector():set(
                         math.random() * 2 - 1,
                         0,
                         math.random() * 2 - 1
                     ):normalize():mul(math.random() * radius) -- possible runaway when close to [0,0,0] vector, consider using `normalize_safe` instead
 
-                    sp = TerEnum:getClosest(vector():set(pos.x + rVec.x, pos.y, pos.z + rVec.z))
-                    dist = sp and self.object:position():distance_to(sp.pos) or math.huge
+                    -- translate to the valid standing position
+                    local lvid = level.vertex_id(rVec:add(pos))
+                    local nPos = lvid > 0 and level.vertex_position(lvid) or vector:set(0, 0, 0);
+                    -- assign and check
+                    if math.abs(nPos.x) + math.abs(nPos.y) + math.abs(nPos.z) > 0.1 then
+                        dist, homeDist, sp = self.object:position():distance_to(nPos), pos:distance_to(nPos), nPos
+                        if homeDist > radius and dist < 2 then -- out of home bounds
+                            dist, homeDist, sp = -math.huge, math.huge, nil
+                        end
+                    else
+                        dist, homeDist, sp = -math.huge, math.huge, nil
+                    end
                     tries = tries - 1
                 end
 
-                if sp and dist < radius and self.object:accessible(sp.lvid) and self.object:accessible(sp.pos) and self:isSafePosition(sp.pos) then
+                if sp and self.object:accessible(sp) and self:isSafePosition(sp) then -- if valid position then go to it
                     local m = dist < 10 and move.walk_fwd or move.run_fwd
-                    action(self.object, move(m, sp.pos), cond(cond.move_end))
+                    action(self.object, move(m, sp), cond(cond.move_end))
+                    self.lastAction = { type = MobLastAction.move, param = sp }
                     self:_timeSet()
                 end
             elseif moveRoll == 2 then -- chill
-                xr_logic.mob_capture(self.object, true)
-
+                -- random direction
                 local vec = vector():set(math.random() * 2 - 1, math.random() * 2 - 1, math.random() * 2 - 1):normalize()
+                -- look in the direction for 5 seconds
                 action(self.object, look(look.direction, vec),  cond(cond.time_end, 5000))
+                self.lastAction = { type = MobLastAction.look, param = vec }
                 self:_timeSet()
-            end
+            else error('WTF!') end -- wrong home action roll?
         end
+    else -- just sit and look around
+        local vec = vector():set(math.random() * 2 - 1, math.random() * 2 - 1, math.random() * 2 - 1):normalize()
+        -- look in the direction for 5 seconds
+        action(self.object, look(look.direction, vec),  cond(cond.time_end, 5000))
+        self.lastAction = { type = MobLastAction.look, param = vec }
+        self:_timeSet()
     end
 end
 
 function MobLogic:forgetAggro() -- forget stuff
     if not self.memory.lastUpdate then self.memory.lastUpdate = time_global() end
-    local elapsed = (time_global() - self.memory.lastUpdate) / 1000
-    self.memory.lastUpdate = time_global()
+    local elapsed = (time_global() - self.memory.lastUpdate) / 1000 -- time delta
+    if elapsed < 0.5 then return end -- too little time has passed
+    self.memory.lastUpdate = time_global() -- reset timer
 
-    local forgetAmount = MobLogic.SoundForgetPerSecond * elapsed
-    for id,val in pairs(self.memory.sound) do
-        val = val <= MobLogic.SoundCap and val - forgetAmount or MobLogic.SoundCap
-        if val > 0 then
-            self.memory.sound[id] = val
-            if val < MobLogic.SoundCap/2 then self.memory.ivestigate[id] = nil end
-        else
-            self.memory.sound[id] = nil
-            self.memory.ivestigate[id] = nil
-        end
+    local forgetAmount = MobLogic.SoundForgetPerSecond * elapsed -- forget how much?
+    for id,snd in pairs(self.memory.sound) do
+        snd.val = snd.val <= MobLogic.SoundCap and snd.val - forgetAmount or MobLogic.SoundCap -- cap or begin forgetting
+        if snd.val <= 0 then self.memory.sound[id] = nil end -- too low, remove sound profile
     end
 
-    if self.memory.vision.who ~= nil and (time_global() - self.memory.vision.when) > (1000 * 10) then
+    local enemy = self.memory.vision.who and level.object_by_id(self.memory.vision.who) or nil
+    if enemy and (
+        not enemy:alive() or (time_global() - self.memory.vision.when) > (1000 * 10) -- dead or 10 secs? I forgor
+    ) then
         self.memory.vision = { who = nil, where = nil, when = nil }
+    end
+    enemy = self.memory.investigation.who and level.object_by_id(self.memory.investigation.who) or nil
+    if enemy and (
+        not enemy:alive() or (time_global() - self.memory.investigation.when) > (1000 * 10) -- dead or 10 secs? I forgor
+    ) then
+        self.memory.investigation = { who = nil, where = nil, when = nil, value = nil }
     end
 end
 
 function MobLogic:evalEnemy(enemy) -- aggro
-    if not self.object or not enemy then return end
-    if self.object:relation(enemy) < game_object.enemy then return false end
+    if
+        (not self.object or not enemy) or -- invalid call
+        not (IsStalker(enemy) or IsMonster(enemy)) or -- not monster or stalker
+        (not enemy:alive()) or -- dead
+        (self.object:relation(enemy) < game_object.enemy) or -- not an enemy
+        (self.object:get_enemy() ~= nil and self.object:get_enemy():id() ~= enemy:id()) -- already has an active enemy
+    then
+        self:forgetAggro()
+        return false
+    end
 
     local distToEnemy = self.object:position():distance_to(enemy:position())
 
-    if not self.logic.nonAggressive then
-        -- cooldown
+    local setVisionMemory = function()
+        if self.memory.vision.who == nil or self.memory.vision.who == enemy:id() then
+            self.memory.vision.who = enemy:id()
+            self.memory.vision.where = vector():set(enemy:position())
+            self.memory.vision.when = time_global()
+        end
+    end
+    -- aggro switch
+    if not self.logic.nonAggressive and (enemy:id() ~= db.actor:id() or not xrs_debug_tools.debug_invis) then
+        -- aggro timer
         if self.memory.vision.who == enemy:id() and (time_global() - self.memory.vision.when) < (1000 * 10) then
-            self.memory.vision.where = enemy:position()
+            self.memory.vision.where = vector():set(enemy:position())
             self:forgetAggro()
             return true
         end
-        -- seeing stuff
-        if self.logic.aggroRange > 0 and distToEnemy <= self.logic.aggroRange then
-            if self.logic.los then
+        -- ambush stuff
+        if self.logic.ambushRange > 0 then
+            if distToEnemy <= self.logic.ambushRange then -- override all, semi-scripted encounter
+                setVisionMemory()
+                self:forgetAggro()
+                return true
+            elseif self.logic.los and distToEnemy <= self.logic.aggroRange then -- los not to be stupid
                 if self.object:see(enemy) then
-                    if self.memory.vision.who == nil or self.memory.vision.who == enemy:id() then
-                        self.memory.vision.who = enemy:id()
-                        self.memory.vision.where = enemy:position()
-                        self.memory.vision.when = time_global()
-                    end
+                    setVisionMemory()
+                    self:forgetAggro()
                     return true
                 end
-            else
-                if self.memory.vision.who == nil or self.memory.vision.who == enemy:id() then
-                    self.memory.vision.who = enemy:id()
-                    self.memory.vision.where = enemy:position()
-                    self.memory.vision.when = time_global()
+            end
+            return false -- force no other logic
+        end
+        -- seeing stuff
+        if self.logic.aggroRange > 0 and distToEnemy <= self.logic.aggroRange then -- within visual range
+            if self.logic.los then -- line of sight required
+                if self.object:see(enemy) then
+                    setVisionMemory()
+                    self:forgetAggro()
+                    return true
                 end
+            else -- line of sight not required
+                setVisionMemory()
+                self:forgetAggro()
                 return true
             end
         end
         -- hearing stuff
-        if self.memory.sound[enemy:id()] ~= nil and self.memory.sound[enemy:id()] >= MobLogic.SoundCap then
-            if self.memory.vision.who == nil or self.memory.vision.who == enemy:id() then
-                self.memory.vision.who = enemy:id()
-                self.memory.vision.where = enemy:position()
-                self.memory.vision.when = time_global()
-            end
+        if self.memory.sound[enemy:id()] ~= nil and self.memory.sound[enemy:id()].val >= MobLogic.SoundCap then -- sound profile aggro
+            setVisionMemory()
             self:forgetAggro()
             return true
-        else self:forgetAggro() end
+        end
     end
 
+    self:forgetAggro()
     return false
 end
 
-MobLogic.AggrSndMap = {
+MobLogic.AggroSndMap = {
     WPN_shoot  = 1,
     WPN_empty  = 1/4,
     WPN_hit    = 1,
@@ -427,25 +521,27 @@ function MobLogic:evalHear(whoId, sType, sDist, sPow, sPos)
 
     local enemy = whoId and level.object_by_id(whoId) or nil
     if
-        not enemy or
-        not MobLogic.AggrSndMap[sType] or
-        self.logic.hearRange <= 0 or
-        sDist > self.logic.hearRange or
-        self.object:relation(enemy) < game_object.enemy
-    then return end
-
+        not enemy or -- invalid call
+        not MobLogic.AggroSndMap[sType] or -- recognized sound
+        not (IsStalker(enemy) or IsMonster(enemy)) or -- not monster or stalker
+        not enemy:alive() or -- dead
+        self.logic.hearRange <= 0 or -- deaf mob
+        sDist > self.logic.hearRange or -- hearing range
+        self.object:relation(enemy) < game_object.enemy -- not an enemy
+    then
+        if self.memory.sound[whoId] then self.memory.sound[whoId] = nil end -- remove invalid profile
+        return
+    end
+    -- divide by 2 every 50
     local sDiv = sDist / 50 * 2
     sDiv = sDiv > 1 and sDiv or 1
-    self.memory.sound[whoId] = (self.memory.sound[whoId] or 0) + (sPow / sDiv * MobLogic.AggrSndMap[sType])
-
-    local isActorSound = db.actor:id() == whoId
-
-    if self.memory.sound[whoId] >= MobLogic.SoundCap and self.memory.vision.who == nil then
-        self.memory.vision.who = whoId
-        self.memory.vision.where = sPos
-        self.memory.vision.when = time_global()
-    elseif self.memory.sound[whoId] >= MobLogic.SoundCap/2 then
-        self.memory.ivestigate[whoId] = sPos
+    -- sound profile addition
+    local valDelta = sPow / sDiv * MobLogic.AggroSndMap[sType]
+    if self.memory.sound[whoId] then
+        self.memory.sound[whoId].val = self.memory.sound[whoId].val + valDelta
+        self.memory.sound[whoId].pos = sType ~= 'WPN_hit' and vector():set(sPos) or self.memory.sound[whoId].pos
+    else
+        self.memory.sound[whoId] = { val = valDelta, pos = vector():set(sPos) }
     end
 end
 
@@ -515,6 +611,8 @@ function AddMobLogic(id, params)
     mobSt.logic.hearRange = params.hearRange >= 0 and params.hearRange or mobSt.logic.aggroRange * 2
     -- aggression
     mobSt.logic.nonAggressive = params.nonAggressive and true or false
+    -- ambush
+    mobSt.logic.ambushRange = params.ambushRange and params.ambushRange or 0
 
 
     if mobSt.reg then TimedAddMobLogic(id, mobSt)
@@ -591,4 +689,15 @@ function on_game_start()
     RegisterScriptCallback('monster_on_net_spawn', monster_on_net_spawn)
     RegisterScriptCallback('npc_on_hear_callback', npc_on_hear_callback)
     RegisterScriptCallback('on_enemy_eval', on_enemy_eval)
+
+    CreateTimeEvent('p1', 'p1', 0, function()
+        if p1 == nil then return end
+        ResetTimeEvent('p1', 'p1', 0.25)
+        p1.part:play_at_pos(p1.pos)
+    end)
+    CreateTimeEvent('p2', 'p2', 0, function()
+        if p2 == nil then return end
+        ResetTimeEvent('p2', 'p2', 0.25)
+        p2.part:play_at_pos(p2.pos)
+    end)
 end
