@@ -366,7 +366,7 @@ function MobLogic:update(delta) -- TODO: fix mobs being stuck on terrain?
 
                     -- translate to the valid standing position
                     local lvid = level.vertex_id(rVec:add(pos))
-                    local nPos = lvid > 0 and level.vertex_position(lvid) or vector:set(0, 0, 0);
+                    local nPos = lvid > 0 and level.vertex_position(lvid) or vector():set(0, 0, 0);
                     -- assign and check
                     if math.abs(nPos.x) + math.abs(nPos.y) + math.abs(nPos.z) > 0.1 then
                         dist, homeDist, sp = self.object:position():distance_to(nPos), pos:distance_to(nPos), nPos
