@@ -21,6 +21,7 @@ logicParams = {
 Callbacks:
  - 'dynmut_on_save' (mobSt: <mob_entry_storage>, state: <alife_store_mngr_obj_state>) - called after mob is saved
  - 'dynmut_on_load' (mobSt: <mob_entry_storage>, state: <alife_store_mngr_obj_state>) - called after mob is loaded
+ - 'dynmut_on_ai_update' (obj: <mob>, logic: MobLogic) - called when mob ai update initiates
 
 ]]
 
@@ -151,6 +152,7 @@ function AddToMobPipeline(id)
     local register = function()
         local simMob = level and level.object_by_id(id)
         if simMob == nil then return false end
+        simMob:set_npc_position(simMob:position():add(vector():set(0, 1, 0))) -- kick before update
 
         Mobs[id].sim = simMob
         Mobs[id].reg = true
@@ -163,13 +165,14 @@ function AddToMobPipeline(id)
     end
 
     local simulate = function()
-        local doRegister = false
+        local doRegister = true
+        --[[local doRegister = false
         if mob.online then
             doRegister = true
         elseif mob:can_switch_online() then
             doRegister = true
             mob:switch_online()
-        end
+        end]]
 
         if doRegister then
             if not register() then _regCC[id] = register end
@@ -191,10 +194,11 @@ end
 
 
 local MobLastAction = {
-    look = 1,
-    move = 2,
-    investigate = 3,
-    pursuit = 4,
+    init = 1,
+    look = 2,
+    move = 3,
+    investigate = 4,
+    pursuit = 5,
 }
 
 -- MobLogic class
@@ -233,8 +237,7 @@ function MobLogic:_timeElapsed()
 end
 
 function MobLogic:_timeSet()
-    local time = time_global()
-    self.last_update = time
+    self.last_update = time_global()
 end
 
 function MobLogic:_inAnomalyRadius(amomale, pos) -- amomale is anomaly server object
@@ -266,18 +269,20 @@ function MobLogic:isSafePosition(pos) -- pos: new mob position
 end
 
 function MobLogic:checkAction(act, pursuitTarget, investigationTarget)
+    if act.type == MobLastAction.init then return true end -- do not skip initialization
+
     local dist = ( -- for move actions
-        act ~= MobLastAction.move or
-        act ~= MobLastAction.investigate or
-        act ~= MobLastAction.pursuit
+        act.type == MobLastAction.move or
+        act.type == MobLastAction.investigate or
+        act.type == MobLastAction.pursuit
     ) and self.object:position():distance_to(act.param) or nil
     if dist then -- some move action
         if dist >= 1 then -- not yet arrived to the target
-            if pursuitTarget and (act ~= MobLastAction.pursuit) then return false -- switch to pursuit
-            elseif investigationTarget and (act ~= MobLastAction.investigate) then return false end -- switch to investigation
+            if pursuitTarget and (act.type ~= MobLastAction.pursuit) then return false -- switch to pursuit
+            elseif investigationTarget and (act.type ~= MobLastAction.investigate) then return false end -- switch to investigation
             return true
         else return false end
-    elseif act == MobLastAction.look then -- look action
+    elseif act.type == MobLastAction.look then -- look action
         if pursuitTarget or investigationTarget then -- new priority
             dist = self.object:position():distance_to(pursuitTarget or investigationTarget)
             return dist < 1 -- keep looking if already at the target
@@ -286,14 +291,23 @@ function MobLogic:checkAction(act, pursuitTarget, investigationTarget)
     error('MobLogic | Unimplemented action logic.')
 end
 
-local p1, p2 = nil, nil
+AddScriptCallback('dynmut_on_ai_update')
 function MobLogic:update(delta) -- TODO: fix mobs being stuck on terrain?
-    --local enemy = self.object:get_enemy()
     if not self.object then return end
 
-    if not xr_logic.mob_captured(self.object) then -- re-capture if no threats
+    if self.last_update == nil then -- first update, prevent some stuck-ing
         xr_logic.mob_capture(self.object, true)
+
+        local id = self.object:id()
+        local pos = vector():set(self.object:position()):add(vector():set(0, 0.5, 0))
+
+        self.object:set_npc_position(pos)
+        --alife():teleport_object(id, db.actor:game_vertex_id(), self.object:level_vertex_id(), pos)
+
+        self:_timeSet()
+        return
     end
+    SendScriptCallback('dynmut_on_ai_update', self.object, self)
 
     for id,snd in pairs(self.memory.sound) do -- update/find investigation direction if any
         if
@@ -312,17 +326,23 @@ function MobLogic:update(delta) -- TODO: fix mobs being stuck on terrain?
 
     -- action decision
     local curAct = self.object:action()
-    if curAct == nil or curAct:completed() or self:_timeElapsed() >= 5 or not self:checkAction(self.lastAction, self.memory.vision.where, investigate) then -- reset/prepare for new action
+    if
+        not xr_logic.mob_captured(self.object) or -- not captured
+        curAct == nil or curAct:completed() or -- no active action
+        self:_timeElapsed() >= 5 or -- taking too long
+        not self:checkAction(self.lastAction, self.memory.vision.where, investigate) -- action counted as completed
+    then
+        -- reset/prepare for new action
         self.lastAction = nil
         xr_logic.mob_capture(self.object, true)
-    else
-        return
-    end -- action still in the process
+    else return end -- action still in the process
 
     -- new action switch
     local moveRoll = math.random(1, 2) -- for home logic purposes
     if self.memory.vision.who ~= nil then -- lost vision and aggro? => go to the last seen position
         if self.object:position():distance_to(self.memory.vision.where) >= 2 then -- not close enough to the last aggro position
+            local pos, _pos = vector(), self.memory.vision.where
+            if self.object:accessible(_pos) then pos = _pos else self.object:accessible_nearest(_pos, pos) end
             action(self.object, move(move.run_fwd, self.memory.vision.where), cond(cond.move_end))
             self.lastAction = { type = MobLastAction.pursuit, param = self.memory.vision.where }
         else moveRoll = 2 end -- just sit around, maybe will find enemy again
@@ -337,8 +357,8 @@ function MobLogic:update(delta) -- TODO: fix mobs being stuck on terrain?
             local rMag = rPos:magnitude()
             rPos = rPos:normalize():mul(math.min(radius, rMag)):add(pos)
             -- translate to the valid standing position
-            local lvid = level.vertex_id(rPos)
-            local sp = lvid > 0 and level.vertex_position(lvid) or nil
+            local sp = vector()
+            if self.object:accessible(rPos) then sp = rPos else self.object:accessible_nearest(rPos, sp) end
             if sp and math.abs(sp.x) + math.abs(sp.y) + math.abs(sp.z) <= 0.1 then sp = nil end
 
             -- got to the position if found, or just sit around
@@ -365,12 +385,13 @@ function MobLogic:update(delta) -- TODO: fix mobs being stuck on terrain?
                     ):normalize():mul(math.random() * radius) -- possible runaway when close to [0,0,0] vector, consider using `normalize_safe` instead
 
                     -- translate to the valid standing position
-                    local lvid = level.vertex_id(rVec:add(pos))
-                    local nPos = lvid > 0 and level.vertex_position(lvid) or vector():set(0, 0, 0);
+                    local _pos = rVec:add(pos)
+                    local nPos = vector()
+                    if self.object:accessible(_pos) then nPos = _pos else self.object:accessible_nearest(_pos, nPos) end
                     -- assign and check
                     if math.abs(nPos.x) + math.abs(nPos.y) + math.abs(nPos.z) > 0.1 then
                         dist, homeDist, sp = self.object:position():distance_to(nPos), pos:distance_to(nPos), nPos
-                        if homeDist > radius and dist < 2 then -- out of home bounds
+                        if homeDist > radius or dist < 2 then -- out of home bounds
                             dist, homeDist, sp = -math.huge, math.huge, nil
                         end
                     else
@@ -432,6 +453,9 @@ end
 function MobLogic:evalEnemy(enemy) -- aggro
     if
         (not self.object or not enemy) or -- invalid call
+        self.last_update == nil -- too soon to do anything
+    then return end
+    if
         not (IsStalker(enemy) or IsMonster(enemy)) or -- not monster or stalker
         (not enemy:alive()) or -- dead
         (self.object:relation(enemy) < game_object.enemy) or -- not an enemy
@@ -517,6 +541,7 @@ MobLogic.AggroSndMap = {
 MobLogic.SoundCap = 3
 MobLogic.SoundForgetPerSecond = MobLogic.SoundCap / 5
 function MobLogic:evalHear(whoId, sType, sDist, sPow, sPos)
+    if not self.object or self.last_update == nil then return end
     sDist = self.object:position():distance_to(sPos) -- overwrite, due to square
 
     local enemy = whoId and level.object_by_id(whoId) or nil

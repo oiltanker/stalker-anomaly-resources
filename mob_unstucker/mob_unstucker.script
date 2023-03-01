@@ -1,0 +1,87 @@
+
+StuckTimeEps = 2 * 1000
+StuckDistEps = 0.5
+MobUpdateInterval = 5
+
+EvTackerUpdate = 'mob_unstack'
+EvTackerTime = 0.1
+MobTracker = {}
+MobTrackerIds = {}
+
+function IsMobMoving(obj)
+    return obj:get_enemy() ~= nil
+end
+
+function MonsterOnUpdate(obj, st)
+    if not obj then return end
+
+    local id = obj:id()
+
+    if not obj:alive() then -- dead
+        if MobTracker[id] then -- no need to track anymore
+            table.remove(MobTrackerIds, MobTracker[id].idx)
+            MobTracker[id] = nil
+        end
+        return
+    end
+
+    if not MobTracker[id] then -- no info
+        table.insert(MobTrackerIds, id)
+        MobTracker[id] = { time = time_global(), pos = vector():set(obj:position()), idx = #MobTrackerIds, uCnt = MobUpdateInterval }
+        return
+    elseif MobTracker[id].uCnt < MobUpdateInterval then
+        MobTracker[id].uCnt = MobTracker[id].uCnt + 1
+        return
+    end
+    MobTracker[id].uCnt = 0
+
+    if not IsMobMoving(obj) then -- idle => reset
+        MobTracker[id].time = time_global()
+        MobTracker[id].pos = vector():set(obj:position())
+        return
+    end
+
+    local elapsed = time_global() - MobTracker[id].time
+    if elapsed >= StuckTimeEps then -- enough time to determine
+        local dist = obj:position():distance_to(MobTracker[id].pos)
+        if dist < StuckDistEps then -- stuck
+            local pos = vector():set(obj:position()):add(vector():set(0, 0.5, 0))
+            alife():teleport_object(id, db.actor:game_vertex_id(), obj:level_vertex_id(), pos) -- TODO: fix not triggering
+        end
+        MobTracker[id].time = time_global()
+        MobTracker[id].pos = vector():set(obj:position())
+    end
+end
+
+local mtiIt = 0
+local function mtiNext() -- get next MobTrackerIds element (looped)
+    if #MobTrackerIds <= 0 then return nil end
+    mtiIt = mtiIt + 1
+    if mtiIt > #MobTrackerIds then mtiIt = 1 end
+    return MobTrackerIds[mtiIt]
+end
+local function mtiRemove() -- remove current MobTrackerIds element
+    table.remove(MobTrackerIds, mtiIt)
+    mtiIt = mtiIt - 1
+end
+
+function TackerUpdate()
+    ResetTimeEvent(EvTackerUpdate, EvTackerUpdate, EvTackerTime)
+
+    local id = mtiNext() -- next id to check
+    if id then
+        local obj = level.object_by_id(id)
+        if not obj or not obj:alive() then -- no longer valid
+            MobTracker[id] = nil
+            mtiRemove()
+        end
+    end
+end
+
+function on_game_start()
+    MobTracker = {}
+    MobTrackerIds = {}
+
+    RegisterScriptCallback('monster_on_update', MonsterOnUpdate)
+    CreateTimeEvent(EvTackerUpdate, EvTackerUpdate, EvTackerTime, TackerUpdate)
+end
